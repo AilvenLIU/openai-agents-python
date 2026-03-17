@@ -1117,6 +1117,24 @@ async def run_single_turn_streamed(
     reasoning_item_id_policy: ReasoningItemIdPolicy | None = None,
 ) -> SingleStepResult:
     """Run a single streamed turn and emit events as results arrive."""
+
+    async def raise_if_input_guardrail_tripwire_known() -> None:
+        tripwire_result = streamed_result._triggered_input_guardrail_result
+        if tripwire_result is not None:
+            raise InputGuardrailTripwireTriggered(tripwire_result)
+
+        task = streamed_result._input_guardrails_task
+        if task is None or not task.done():
+            return
+
+        guardrail_exception = task.exception()
+        if guardrail_exception is not None:
+            raise guardrail_exception
+
+        tripwire_result = streamed_result._triggered_input_guardrail_result
+        if tripwire_result is not None:
+            raise InputGuardrailTripwireTriggered(tripwire_result)
+
     emitted_tool_call_ids: set[str] = set()
     emitted_reasoning_item_ids: set[str] = set()
     emitted_tool_search_fingerprints: set[str] = set()
@@ -1450,6 +1468,7 @@ async def run_single_turn_streamed(
         run_config=run_config,
         tool_use_tracker=tool_use_tracker,
         event_queue=streamed_result._event_queue,
+        before_side_effects=raise_if_input_guardrail_tripwire_known,
     )
 
     items_to_filter = session_items_for_turn(single_step_result)

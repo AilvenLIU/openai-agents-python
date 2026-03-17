@@ -1696,6 +1696,7 @@ async def get_single_step_result_from_response(
     run_config: RunConfig,
     tool_use_tracker,
     event_queue: asyncio.Queue[StreamEvent | QueueCompleteSentinel] | None = None,
+    before_side_effects: Callable[[], Awaitable[None]] | None = None,
 ) -> SingleStepResult:
     processed_response = process_model_response(
         agent=agent,
@@ -1705,6 +1706,9 @@ async def get_single_step_result_from_response(
         handoffs=handoffs,
         existing_items=pre_step_items,
     )
+
+    if before_side_effects is not None:
+        await before_side_effects()
 
     tool_use_tracker.record_processed_response(agent, processed_response)
 
