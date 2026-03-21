@@ -43,7 +43,7 @@ from ..agent import Agent, ToolsToFinalOutputResult
 from ..agent_output import AgentOutputSchemaBase
 from ..agent_tool_state import get_agent_tool_state_scope, peek_agent_tool_run_result
 from ..exceptions import ModelBehaviorError, UserError
-from ..handoffs import Handoff, HandoffInputData, nest_handoff_history
+from ..handoffs import Handoff, HandoffInputData, HandoffInputFilter, nest_handoff_history
 from ..items import (
     CompactionItem,
     HandoffCallItem,
@@ -282,6 +282,38 @@ async def execute_final_output(
     )
 
 
+def _resolve_server_managed_handoff_behavior(
+    *,
+    handoff: Handoff[Any, Agent[Any]],
+    from_agent: Agent[Any],
+    to_agent: Agent[Any],
+    run_config: RunConfig,
+    server_manages_conversation: bool,
+    input_filter: HandoffInputFilter | None,
+    should_nest_history: bool,
+) -> tuple[HandoffInputFilter | None, bool]:
+    if not server_manages_conversation:
+        return input_filter, should_nest_history
+
+    if input_filter is not None:
+        raise UserError(
+            "Server-managed conversations do not support handoff input filters. "
+            "Remove Handoff.input_filter or RunConfig.handoff_input_filter, "
+            "or disable conversation_id, previous_response_id, and auto_previous_response_id."
+        )
+
+    if not should_nest_history:
+        return input_filter, should_nest_history
+
+    logger.warning(
+        "Server-managed conversations do not support nest_handoff_history for handoff "
+        "%s -> %s. Disabling nested handoff history and continuing with delta-only input.",
+        from_agent.name,
+        to_agent.name,
+    )
+    return input_filter, False
+
+
 async def execute_handoffs(
     *,
     agent: Agent[TContext],
@@ -293,6 +325,7 @@ async def execute_handoffs(
     hooks: RunHooks[TContext],
     context_wrapper: RunContextWrapper[TContext],
     run_config: RunConfig,
+    server_manages_conversation: bool = False,
     nest_handoff_history_fn: Callable[..., HandoffInputData] | None = None,
 ) -> SingleStepResult:
     """Execute a handoff and prepare the next turn for the new agent."""
@@ -371,6 +404,15 @@ async def execute_handoffs(
             handoff_nest_setting
             if handoff_nest_setting is not None
             else run_config.nest_handoff_history
+        )
+        input_filter, should_nest_history = _resolve_server_managed_handoff_behavior(
+            handoff=handoff,
+            from_agent=agent,
+            to_agent=new_agent,
+            run_config=run_config,
+            server_manages_conversation=server_manages_conversation,
+            input_filter=input_filter,
+            should_nest_history=should_nest_history,
         )
         handoff_input_data: HandoffInputData | None = None
         session_step_items: list[RunItem] | None = None
@@ -507,6 +549,7 @@ async def execute_tools_and_side_effects(
     hooks: RunHooks[TContext],
     context_wrapper: RunContextWrapper[TContext],
     run_config: RunConfig,
+    server_manages_conversation: bool = False,
 ) -> SingleStepResult:
     """Run one turn of the loop, coordinating tools, approvals, guardrails, and handoffs."""
 
@@ -596,6 +639,7 @@ async def execute_tools_and_side_effects(
             hooks=hooks,
             context_wrapper=context_wrapper,
             run_config=run_config,
+            server_manages_conversation=server_manages_conversation,
         )
 
     tool_final_output = await _maybe_finalize_from_tool_results(
@@ -672,6 +716,7 @@ async def resolve_interrupted_turn(
     hooks: RunHooks[TContext],
     context_wrapper: RunContextWrapper[TContext],
     run_config: RunConfig,
+    server_manages_conversation: bool = False,
     run_state: RunState | None = None,
     nest_handoff_history_fn: Callable[..., HandoffInputData] | None = None,
 ) -> SingleStepResult:
@@ -1241,6 +1286,7 @@ async def resolve_interrupted_turn(
             hooks=hooks,
             context_wrapper=context_wrapper,
             run_config=run_config,
+            server_manages_conversation=server_manages_conversation,
             nest_handoff_history_fn=nest_history,
         )
 
@@ -1695,6 +1741,7 @@ async def get_single_step_result_from_response(
     context_wrapper: RunContextWrapper[TContext],
     run_config: RunConfig,
     tool_use_tracker,
+    server_manages_conversation: bool = False,
     event_queue: asyncio.Queue[StreamEvent | QueueCompleteSentinel] | None = None,
 ) -> SingleStepResult:
     processed_response = process_model_response(
@@ -1725,4 +1772,5 @@ async def get_single_step_result_from_response(
         hooks=hooks,
         context_wrapper=context_wrapper,
         run_config=run_config,
+        server_manages_conversation=server_manages_conversation,
     )
