@@ -33,9 +33,11 @@ The most common properties of an agent are:
 | `model_settings` | no | Model tuning parameters such as `temperature`, `top_p`, and `tool_choice`. |
 | `tools` | no | Tools the agent can call. See [Tools](tools.md). |
 | `mcp_servers` | no | MCP-backed tools for the agent. See the [MCP guide](mcp.md). |
+| `mcp_config` | no | Fine-tune how MCP tools are prepared, such as strict schema conversion and MCP failure formatting. See the [MCP guide](mcp.md#agent-level-mcp-configuration). |
 | `input_guardrails` | no | Guardrails that run on the first user input for this agent chain. See [Guardrails](guardrails.md). |
 | `output_guardrails` | no | Guardrails that run on the final output for this agent. See [Guardrails](guardrails.md). |
 | `output_type` | no | Structured output type instead of plain text. See [Output types](#output-types). |
+| `hooks` | no | Agent-scoped lifecycle callbacks. See [Lifecycle events (hooks)](#lifecycle-events-hooks). |
 | `tool_use_behavior` | no | Control whether tool results loop back to the model or end the run. See [Tool use behavior](#tool-use-behavior). |
 | `reset_tool_choice` | no | Reset `tool_choice` after a tool call (default: `True`) to avoid tool-use loops. See [Forcing tool use](#forcing-tool-use). |
 

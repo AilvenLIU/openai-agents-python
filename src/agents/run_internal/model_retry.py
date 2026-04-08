@@ -284,10 +284,10 @@ def _default_retry_delay(
         else DEFAULT_BACKOFF_JITTER
     )
 
-    delay = min(initial_delay * (multiplier ** max(attempt - 1, 0)), max_delay)
+    base = min(initial_delay * (multiplier ** max(attempt - 1, 0)), max_delay)
     if not use_jitter:
-        return delay
-    return max(delay * (0.875 + random.random() * 0.25), 0.0)
+        return base
+    return min(max(base * (0.875 + random.random() * 0.25), 0.0), max_delay)
 
 
 async def _sleep_for_retry(delay: float) -> None:

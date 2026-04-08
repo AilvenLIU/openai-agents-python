@@ -741,6 +741,29 @@ async def test_multiple_tool_calls_use_default_failure_error_function_for_manual
 
 
 @pytest.mark.asyncio
+async def test_single_tool_call_uses_default_failure_error_function_for_cancelled_tool():
+    async def _cancel_tool() -> str:
+        raise asyncio.CancelledError("tool-cancelled")
+
+    cancel_tool = function_tool(_cancel_tool, name_override="cancel_tool")
+    agent = Agent(name="test", tools=[cancel_tool])
+    response = ModelResponse(
+        output=[get_function_tool_call("cancel_tool", "{}", call_id="1")],
+        usage=Usage(),
+        response_id=None,
+    )
+
+    result = await get_execute_result(agent, response)
+
+    assert len(result.generated_items) == 2
+    assert isinstance(result.next_step, NextStepRunAgain)
+    assert_item_is_function_tool_call_output(
+        result.generated_items[1],
+        "An error occurred while running the tool. Please try again. Error: tool-cancelled",
+    )
+
+
+@pytest.mark.asyncio
 async def test_multiple_tool_calls_surface_hook_failure_over_sibling_cancellation():
     hook_started = asyncio.Event()
 
@@ -1161,6 +1184,61 @@ async def test_execute_function_tool_calls_parent_cancellation_skips_post_invoke
     assert not failure_handler_called.is_set()
     assert not output_guardrail_called.is_set()
     assert not on_tool_end_called.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(asyncio, "eager_task_factory"),
+    reason="eager_task_factory requires Python 3.12+",
+)
+async def test_execute_function_tool_calls_eager_task_factory_tracks_state_safely():
+    async def _first_tool() -> str:
+        return "first"
+
+    async def _second_tool() -> str:
+        return "second"
+
+    first_tool = function_tool(_first_tool, name_override="first_tool")
+    second_tool = function_tool(_second_tool, name_override="second_tool")
+    tool_runs = [
+        ToolRunFunction(
+            tool_call=cast(
+                ResponseFunctionToolCall,
+                get_function_tool_call("first_tool", "{}", call_id="call-1"),
+            ),
+            function_tool=first_tool,
+        ),
+        ToolRunFunction(
+            tool_call=cast(
+                ResponseFunctionToolCall,
+                get_function_tool_call("second_tool", "{}", call_id="call-2"),
+            ),
+            function_tool=second_tool,
+        ),
+    ]
+    loop = asyncio.get_running_loop()
+    previous_task_factory = loop.get_task_factory()
+    eager_task_factory = cast(Any, asyncio.eager_task_factory)
+    loop.set_task_factory(eager_task_factory)
+
+    try:
+        (
+            function_results,
+            input_guardrail_results,
+            output_guardrail_results,
+        ) = await execute_function_tool_calls(
+            agent=Agent(name="test", tools=[first_tool, second_tool]),
+            tool_runs=tool_runs,
+            hooks=RunHooks(),
+            context_wrapper=RunContextWrapper(None),
+            config=RunConfig(),
+        )
+    finally:
+        loop.set_task_factory(previous_task_factory)
+
+    assert [result.output for result in function_results] == ["first", "second"]
+    assert input_guardrail_results == []
+    assert output_guardrail_results == []
 
 
 @pytest.mark.asyncio
@@ -2853,4 +2931,65 @@ async def test_execute_tools_emits_hosted_mcp_rejection_response():
     assert responses, "Rejection should emit an MCP approval response."
     assert responses[0].raw_item["approve"] is False
     assert responses[0].raw_item["approval_request_id"] == "mcp-approval-reject"
+    assert "reason" not in responses[0].raw_item
     assert not isinstance(result.next_step, NextStepInterruption)
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_emits_hosted_mcp_rejection_reason_from_explicit_message():
+    """Hosted MCP rejections should forward explicit rejection messages as reasons."""
+
+    mcp_tool = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "test_mcp_server",
+            "server_url": "https://example.com",
+            "require_approval": "always",
+        },
+        on_approval_request=None,
+    )
+    agent = make_agent(tools=[mcp_tool])
+    request_item = McpApprovalRequest(
+        id="mcp-approval-reject-reason",
+        type="mcp_approval_request",
+        server_label="test_mcp_server",
+        arguments="{}",
+        name="list_repo_languages",
+    )
+    processed_response = make_processed_response(
+        new_items=[MCPApprovalRequestItem(raw_item=request_item, agent=agent)],
+        mcp_approval_requests=[
+            ToolRunMCPApprovalRequest(
+                request_item=request_item,
+                mcp_tool=mcp_tool,
+            )
+        ],
+    )
+    context_wrapper = make_context_wrapper()
+    reject_tool_call(
+        context_wrapper,
+        agent,
+        request_item,
+        tool_name="list_repo_languages",
+        rejection_message="Denied by policy",
+    )
+
+    result = await run_loop.execute_tools_and_side_effects(
+        agent=agent,
+        original_input="test",
+        pre_step_items=[],
+        new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
+        processed_response=processed_response,
+        output_schema=None,
+        hooks=RunHooks(),
+        context_wrapper=context_wrapper,
+        run_config=RunConfig(),
+    )
+
+    responses = [
+        item for item in result.new_step_items if isinstance(item, MCPApprovalResponseItem)
+    ]
+    assert responses, "Rejection should emit an MCP approval response."
+    assert responses[0].raw_item["approve"] is False
+    assert responses[0].raw_item["approval_request_id"] == "mcp-approval-reject-reason"
+    assert responses[0].raw_item["reason"] == "Denied by policy"

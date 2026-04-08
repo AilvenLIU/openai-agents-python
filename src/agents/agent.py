@@ -791,25 +791,37 @@ class Agent(AgentBase, Generic[TContext]):
                                 break
 
                     dispatch_task = asyncio.create_task(dispatch_stream_events())
+                    stream_iteration_cancelled = False
 
                     try:
                         from .stream_events import AgentUpdatedStreamEvent
 
                         current_agent = run_result_streaming.current_agent
-                        async for event in run_result_streaming.stream_events():
-                            if isinstance(event, AgentUpdatedStreamEvent):
-                                current_agent = event.new_agent
+                        try:
+                            async for event in run_result_streaming.stream_events():
+                                if isinstance(event, AgentUpdatedStreamEvent):
+                                    current_agent = event.new_agent
 
-                            payload: AgentToolStreamEvent = {
-                                "event": event,
-                                "agent": current_agent,
-                                "tool_call": context.tool_call,
-                            }
-                            await event_queue.put(payload)
+                                payload: AgentToolStreamEvent = {
+                                    "event": event,
+                                    "agent": current_agent,
+                                    "tool_call": context.tool_call,
+                                }
+                                await event_queue.put(payload)
+                        except asyncio.CancelledError:
+                            stream_iteration_cancelled = True
+                            raise
                     finally:
-                        await event_queue.put(None)
-                        await event_queue.join()
-                        await dispatch_task
+                        if stream_iteration_cancelled:
+                            dispatch_task.cancel()
+                            try:
+                                await dispatch_task
+                            except asyncio.CancelledError:
+                                pass
+                        else:
+                            await event_queue.put(None)
+                            await event_queue.join()
+                            await dispatch_task
                     run_result = run_result_streaming
                 else:
                     run_result = await Runner.run(
@@ -839,6 +851,26 @@ class Agent(AgentBase, Generic[TContext]):
 
             if custom_output_extractor:
                 return await custom_output_extractor(run_result)
+
+            if run_result.final_output is not None and (
+                not isinstance(run_result.final_output, str) or run_result.final_output != ""
+            ):
+                return run_result.final_output
+
+            from .items import ItemHelpers, MessageOutputItem, ToolCallOutputItem
+
+            for item in reversed(run_result.new_items):
+                if isinstance(item, MessageOutputItem):
+                    text_output = ItemHelpers.text_message_output(item)
+                    if text_output:
+                        return text_output
+
+                if (
+                    isinstance(item, ToolCallOutputItem)
+                    and isinstance(item.output, str)
+                    and item.output
+                ):
+                    return item.output
 
             return run_result.final_output
 

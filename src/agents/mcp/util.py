@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import functools
 import inspect
@@ -13,7 +14,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from .. import _debug
 from .._mcp_tool_metadata import resolve_mcp_tool_description_for_model, resolve_mcp_tool_title
-from ..exceptions import AgentsException, ModelBehaviorError, UserError
+from ..exceptions import AgentsException, MCPToolCancellationError, ModelBehaviorError, UserError
 
 try:
     from mcp.shared.exceptions import McpError as _McpError
@@ -178,6 +179,28 @@ def create_static_tool_filter(
 class MCPUtil:
     """Set of utilities for interop between MCP and Agents SDK tools."""
 
+    @staticmethod
+    def _extract_static_meta(tool: Any) -> dict[str, Any] | None:
+        meta = getattr(tool, "meta", None)
+        if isinstance(meta, dict):
+            return copy.deepcopy(meta)
+
+        model_extra = getattr(tool, "model_extra", None)
+        if isinstance(model_extra, dict):
+            extra_meta = model_extra.get("meta")
+            if isinstance(extra_meta, dict):
+                return copy.deepcopy(extra_meta)
+
+        model_dump = getattr(tool, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump()
+            if isinstance(dumped, dict):
+                dumped_meta = dumped.get("meta")
+                if isinstance(dumped_meta, dict):
+                    return copy.deepcopy(dumped_meta)
+
+        return None
+
     @classmethod
     async def get_all_function_tools(
         cls,
@@ -252,7 +275,13 @@ class MCPUtil:
         policies. If the server uses a callable approval policy, approvals default
         to required to avoid bypassing dynamic checks.
         """
-        invoke_func_impl = functools.partial(cls.invoke_mcp_tool, server, tool)
+        static_meta = cls._extract_static_meta(tool)
+        invoke_func_impl = functools.partial(
+            cls.invoke_mcp_tool,
+            server,
+            tool,
+            meta=static_meta,
+        )
         effective_failure_error_function = server._get_failure_error_function(
             failure_error_function
         )
@@ -365,12 +394,31 @@ class MCPUtil:
         try:
             resolved_meta = await cls._resolve_meta(server, context, tool.name, json_data)
             merged_meta = cls._merge_mcp_meta(resolved_meta, meta)
-            if merged_meta is None:
-                result = await server.call_tool(tool.name, json_data)
-            else:
-                result = await server.call_tool(tool.name, json_data, meta=merged_meta)
-        except UserError:
-            # Re-raise UserError as-is (it already has a good message)
+            call_task = asyncio.create_task(
+                server.call_tool(tool.name, json_data)
+                if merged_meta is None
+                else server.call_tool(tool.name, json_data, meta=merged_meta)
+            )
+            try:
+                done, _ = await asyncio.wait({call_task}, return_when=asyncio.FIRST_COMPLETED)
+                finished_task = done.pop()
+                if finished_task.cancelled():
+                    raise MCPToolCancellationError(
+                        f"Failed to call tool '{tool.name}' on MCP server '{server.name}': "
+                        "tool execution was cancelled."
+                    )
+                result = finished_task.result()
+            except asyncio.CancelledError:
+                if not call_task.done():
+                    call_task.cancel()
+                try:
+                    await call_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise
+        except (UserError, MCPToolCancellationError):
+            # Re-raise handled tool-call errors as-is; the FunctionTool failure pipeline
+            # will format them into model-visible tool errors when appropriate.
             raise
         except Exception as e:
             if _McpError is not None and isinstance(e, _McpError):

@@ -10,8 +10,6 @@ theme:
     - navigation.path
     # Shows sections in the sidebar
     - navigation.sections
-    # Shows sections expanded by default
-    - navigation.expand
     # Enables annotations in code blocks
     - content.code.annotate
   palette:
@@ -56,9 +54,7 @@ plugins:
             - Configuration: config.md
             - Documentation:
                 - agents.md
-                - Models:
-                    - models/index.md
-                    - models/litellm.md
+                - Models: models/index.md
                 - tools.md
                 - guardrails.md
                 - running_agents.md
@@ -160,7 +156,11 @@ plugins:
                 - Extensions:
                     - ref/extensions/handoff_filters.md
                     - ref/extensions/handoff_prompt.md
-                    - ref/extensions/litellm.md
+                    - Third-party adapters:
+                        - Any-LLM model: ref/extensions/models/any_llm_model.md
+                        - Any-LLM provider: ref/extensions/models/any_llm_provider.md
+                        - LiteLLM model: ref/extensions/models/litellm_model.md
+                        - LiteLLM provider: ref/extensions/models/litellm_provider.md
                     - ref/extensions/tool_output_trimmer.md
                     - ref/extensions/memory/sqlalchemy_session.md
                     - ref/extensions/memory/async_sqlite_session.md
@@ -177,9 +177,7 @@ plugins:
             - config.md
             - ドキュメント:
                 - agents.md
-                - モデル:
-                    - models/index.md
-                    - models/litellm.md
+                - モデル: models/index.md
                 - tools.md
                 - guardrails.md
                 - running_agents.md
@@ -217,9 +215,7 @@ plugins:
             - config.md
             - 문서:
                 - agents.md
-                - 모델:
-                    - models/index.md
-                    - models/litellm.md
+                - 모델: models/index.md
                 - tools.md
                 - guardrails.md
                 - running_agents.md
@@ -257,9 +253,7 @@ plugins:
             - config.md
             - 文档:
                 - agents.md
-                - 模型:
-                    - models/index.md
-                    - models/litellm.md
+                - 模型: models/index.md
                 - tools.md
                 - guardrails.md
                 - running_agents.md

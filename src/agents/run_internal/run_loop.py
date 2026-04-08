@@ -35,6 +35,7 @@ from ..exceptions import (
     InputGuardrailTripwireTriggered,
     MaxTurnsExceeded,
     ModelBehaviorError,
+    OutputGuardrailTripwireTriggered,
     RunErrorDetails,
     UserError,
 )
@@ -81,10 +82,7 @@ from ..tracing.span_data import AgentSpanData
 from ..usage import Usage
 from ..util import _coro, _error_tracing
 from .agent_runner_helpers import apply_resumed_conversation_settings
-from .approvals import (
-    append_input_items_excluding_approvals,
-    approvals_from_step,
-)
+from .approvals import approvals_from_step
 from .error_handlers import (
     build_run_error_data,
     create_message_output_item,
@@ -105,8 +103,9 @@ from .items import (
     copy_input_items,
     deduplicate_input_items_preferring_latest,
     ensure_input_item_format,
-    normalize_input_items_for_api,
     normalize_resumed_input,
+    prepare_model_input_items,
+    run_items_to_input_items,
 )
 from .model_retry import (
     apply_retry_attempt_usage,
@@ -245,6 +244,17 @@ __all__ = [
 ]
 
 
+def _should_attach_generic_agent_error(exc: Exception) -> bool:
+    return not isinstance(
+        exc,
+        (
+            ModelBehaviorError,
+            InputGuardrailTripwireTriggered,
+            OutputGuardrailTripwireTriggered,
+        ),
+    )
+
+
 async def _should_persist_stream_items(
     *,
     session: Session | None,
@@ -255,6 +265,16 @@ async def _should_persist_stream_items(
         return False
     should_skip_session_save = await input_guardrail_tripwire_triggered_for_stream(streamed_result)
     return should_skip_session_save is False
+
+
+def _prepare_turn_input_items(
+    caller_input: str | list[TResponseInputItem],
+    generated_items: list[RunItem],
+    reasoning_item_id_policy: ReasoningItemIdPolicy | None,
+) -> list[TResponseInputItem]:
+    caller_items = ItemHelpers.input_to_new_input_list(caller_input)
+    continuation_items = run_items_to_input_items(generated_items, reasoning_item_id_policy)
+    return prepare_model_input_items(caller_items, continuation_items)
 
 
 def _complete_stream_interruption(
@@ -349,7 +369,12 @@ async def _run_output_guardrails_for_stream(
 
     try:
         return cast(list[Any], await streamed_result._output_guardrails_task)
+    except OutputGuardrailTripwireTriggered:
+        raise
+    except asyncio.CancelledError:
+        raise
     except Exception:
+        logger.error("Unexpected error in output guardrails", exc_info=True)
         return []
 
 
@@ -488,6 +513,11 @@ async def start_streaming(
         streamed_result._state = run_state
     if run_state is not None:
         streamed_result._model_input_items = list(run_state._generated_items)
+        # Streamed follow-ups need the same normalized replay signal as sync runs when the
+        # runner's continuation differs from the richer session history.
+        streamed_result._replay_from_model_input_items = list(run_state._generated_items) != list(
+            run_state._session_items
+        )
 
     if run_state is not None:
         run_state._conversation_id = conversation_id
@@ -632,6 +662,9 @@ async def start_streaming(
                     )
                     streamed_result._model_input_items = generated_items
                     streamed_result.new_items = base_session_items + list(turn_session_items)
+                    streamed_result._replay_from_model_input_items = list(
+                        streamed_result._model_input_items
+                    ) != list(streamed_result.new_items)
                     if run_state is not None:
                         update_run_state_after_resume(
                             run_state,
@@ -919,6 +952,9 @@ async def start_streaming(
                 )
                 turn_session_items = session_items_for_turn(turn_result)
                 streamed_result.new_items.extend(turn_session_items)
+                streamed_result._replay_from_model_input_items = list(
+                    streamed_result._model_input_items
+                ) != list(streamed_result.new_items)
                 store_setting = current_agent.model_settings.resolve(
                     run_config.model_settings
                 ).store
@@ -1008,7 +1044,7 @@ async def start_streaming(
                         streamed_result._event_queue.put_nowait(QueueCompleteSentinel())
                         break
             except Exception as e:
-                if current_span and not isinstance(e, ModelBehaviorError):
+                if current_span and _should_attach_generic_agent_error(e):
                     _error_tracing.attach_error_to_span(
                         current_span,
                         SpanError(
@@ -1031,7 +1067,7 @@ async def start_streaming(
         )
         raise
     except Exception as e:
-        if current_span and not isinstance(e, ModelBehaviorError):
+        if current_span and _should_attach_generic_agent_error(e):
             _error_tracing.attach_error_to_span(
                 current_span,
                 SpanError(
@@ -1177,15 +1213,11 @@ async def run_single_turn_streamed(
             else 0,
         )
     else:
-        input = ItemHelpers.input_to_new_input_list(streamed_result.input)
-        append_input_items_excluding_approvals(
-            input,
+        input = _prepare_turn_input_items(
+            streamed_result.input,
             streamed_result._model_input_items,
             reasoning_item_id_policy,
         )
-
-    if isinstance(input, list):
-        input = normalize_input_items_for_api(input)
 
     filtered = await maybe_filter_model_input(
         agent=agent,
@@ -1539,23 +1571,7 @@ async def run_single_turn(
     if server_conversation_tracker is not None:
         input = server_conversation_tracker.prepare_input(original_input, generated_items)
     else:
-        input = ItemHelpers.input_to_new_input_list(original_input)
-        if isinstance(input, list):
-            append_input_items_excluding_approvals(
-                input,
-                generated_items,
-                reasoning_item_id_policy,
-            )
-        else:
-            input = ItemHelpers.input_to_new_input_list(input)
-            append_input_items_excluding_approvals(
-                input,
-                generated_items,
-                reasoning_item_id_policy,
-            )
-
-    if isinstance(input, list):
-        input = normalize_input_items_for_api(input)
+        input = _prepare_turn_input_items(original_input, generated_items, reasoning_item_id_policy)
 
     new_response = await get_new_response(
         agent,

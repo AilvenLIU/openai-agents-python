@@ -497,6 +497,46 @@ async def test_streamed_parallel_tool_call_with_cancelled_sibling_reaches_final_
 
 
 @pytest.mark.asyncio
+async def test_streamed_single_tool_call_with_cancelled_tool_reaches_final_output() -> None:
+    async def _cancel_tool() -> str:
+        raise asyncio.CancelledError("tool-cancelled")
+
+    model = FakeModel()
+    agent = Agent(
+        name="test",
+        model=model,
+        tools=[function_tool(_cancel_tool, name_override="cancel_tool")],
+    )
+
+    model.add_multiple_turn_outputs(
+        [
+            [get_function_tool_call("cancel_tool", "{}", call_id="call_cancel")],
+            [get_text_message("final answer")],
+        ]
+    )
+
+    result = Runner.run_streamed(agent, input="user_message")
+    await consume_stream(result)
+
+    assert result.final_output == "final answer"
+    assert len(result.raw_responses) == 2
+
+    second_turn_input = cast(list[dict[str, Any]], model.last_turn_args["input"])
+    tool_outputs = [
+        item for item in second_turn_input if item.get("type") == "function_call_output"
+    ]
+    assert tool_outputs == [
+        {
+            "call_id": "call_cancel",
+            "output": (
+                "An error occurred while running the tool. Please try again. Error: tool-cancelled"
+            ),
+            "type": "function_call_output",
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_streamed_reasoning_item_id_policy_omits_follow_up_reasoning_ids() -> None:
     model = FakeModel()
     agent = Agent(
@@ -668,6 +708,10 @@ async def test_structured_output():
     assert len(result.to_input_list()) == 10, (
         "should have input: conversation summary, function call, function call result, message, "
         "handoff, handoff output, preamble message, tool call, tool call result, final output"
+    )
+    assert len(result.to_input_list(mode="normalized")) == 6, (
+        "should have normalized replay input: conversation summary, carried-forward message, "
+        "preamble message, tool call, tool call result, final output"
     )
 
     assert result.last_agent == agent_1, "should have handed off to agent_1"
@@ -1287,6 +1331,34 @@ async def test_output_guardrail_tripwire_triggered_causes_exception_streamed():
 
 
 @pytest.mark.asyncio
+async def test_output_guardrail_tripwire_raises_from_run_loop_task_before_stream_consumption():
+    def guardrail_function(
+        context: RunContextWrapper[Any], agent: Agent[Any], agent_output: Any
+    ) -> GuardrailFunctionOutput:
+        return GuardrailFunctionOutput(
+            output_info=None,
+            tripwire_triggered=True,
+        )
+
+    model = FakeModel(initial_output=[get_text_message("first_test")])
+
+    agent = Agent(
+        name="test",
+        output_guardrails=[OutputGuardrail(guardrail_function=guardrail_function)],
+        model=model,
+    )
+
+    result = Runner.run_streamed(agent, input="user_message")
+
+    assert result.run_loop_task is not None
+    with pytest.raises(OutputGuardrailTripwireTriggered):
+        await result.run_loop_task
+
+    assert result.final_output is None
+    assert result.is_complete is True
+
+
+@pytest.mark.asyncio
 async def test_run_input_guardrail_tripwire_triggered_causes_exception_streamed():
     def guardrail_function(
         context: RunContextWrapper[Any], agent: Agent[Any], input: Any
@@ -1397,6 +1469,10 @@ async def test_streaming_events():
     assert len(result.to_input_list()) == 9, (
         "should have input: conversation summary, function call, function call result, message, "
         "handoff, handoff output, tool call, tool call result, final output"
+    )
+    assert len(result.to_input_list(mode="normalized")) == 5, (
+        "should have normalized replay input: conversation summary, carried-forward message, "
+        "tool call, tool call result, final output"
     )
 
     assert result.last_agent == agent_1, "should have handed off to agent_1"

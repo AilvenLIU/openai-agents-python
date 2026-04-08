@@ -3,11 +3,12 @@
 You are Codex running in CI to propose labels for a pull request in the openai-agents-python repository.
 
 Inputs:
+- PR context: .tmp/pr-labels/pr-context.json
 - PR diff: .tmp/pr-labels/changes.diff
 - Changed files: .tmp/pr-labels/changed-files.txt
 
 Task:
-- Inspect the diff and changed files.
+- Inspect the PR context, diff, and changed files.
 - Output JSON with a single top-level key: "labels" (array of strings).
 - Only use labels from the allowed list.
 - Prefer false negatives over false positives. If you are unsure, leave the label out.
@@ -21,7 +22,7 @@ Allowed labels:
 - dependencies
 - feature:chat-completions
 - feature:core
-- feature:lite-llm
+- feature:extensions
 - feature:mcp
 - feature:realtime
 - feature:sessions
@@ -45,7 +46,7 @@ Label rules:
 - bug vs enhancement: Prefer exactly one of these. Include both only when the PR clearly contains two separate substantial changes and both are first-order outcomes.
 - feature:chat-completions: Chat Completions support or conversion is a primary deliverable of the PR. Do not add it for a small compatibility guard or parity update in `chatcmpl_converter.py`.
 - feature:core: Core agent loop, tool calls, run pipeline, or other central runtime behavior is a primary surface of the PR. For cross-cutting runtime changes, this is usually the single best feature label.
-- feature:lite-llm: LiteLLM adapter/provider behavior is a primary deliverable of the PR.
+- feature:extensions: `src/agents/extensions/` surfaces are a primary deliverable of the PR, including extension models/providers such as Any-LLM and LiteLLM.
 - feature:mcp: MCP-specific behavior or APIs are a primary deliverable of the PR. Do not add it for incidental hosted/deferred tool plumbing touched by broader runtime work.
 - feature:realtime: Realtime-specific behavior, API shape, or session semantics are a primary deliverable of the PR. Do not add it for small parity updates in realtime adapters.
 - feature:sessions: Session or memory behavior is a primary deliverable of the PR. Do not add it for persistence updates that merely support a broader feature.
@@ -53,7 +54,7 @@ Label rules:
 - feature:voice: Voice pipeline behavior is a primary deliverable of the PR.
 
 Decision process:
-1. Determine the PR's primary intent in one sentence from the title and dominant runtime diff.
+1. Determine the PR's primary intent in one sentence from the PR title/body and dominant runtime diff.
 2. Start with zero labels.
 3. Add `bug` or `enhancement` conservatively.
 4. Add only the minimum `feature:*` labels needed to describe the primary surface area.
