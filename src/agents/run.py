@@ -663,6 +663,7 @@ class AgentRunner:
                                 hooks=hooks,
                                 context_wrapper=context_wrapper,
                                 run_config=run_config,
+                                server_manages_conversation=server_conversation_tracker is not None,
                                 run_state=run_state,
                             )
 
