@@ -70,8 +70,14 @@ async def run_input_guardrails_with_queue(
     try:
         for done in asyncio.as_completed(guardrail_tasks):
             result = await done
+            guardrail_results.append(result)
             if result.output.tripwire_triggered:
+                streamed_result.input_guardrail_results = (
+                    streamed_result.input_guardrail_results + guardrail_results
+                )
+                guardrail_results = []
                 streamed_result._triggered_input_guardrail_result = result
+                queue.put_nowait(result)
                 for t in guardrail_tasks:
                     t.cancel()
                 await asyncio.gather(*guardrail_tasks, return_exceptions=True)
@@ -85,11 +91,8 @@ async def run_input_guardrails_with_queue(
                         },
                     ),
                 )
-                queue.put_nowait(result)
-                guardrail_results.append(result)
                 break
             queue.put_nowait(result)
-            guardrail_results.append(result)
     except Exception:
         for t in guardrail_tasks:
             t.cancel()
