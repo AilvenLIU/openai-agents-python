@@ -76,6 +76,7 @@ from ..stream_events import (
 )
 from ..tool import (
     FunctionTool,
+    ProgrammaticToolCallingTool,
     Tool,
     ToolOrigin,
     ToolOriginType,
@@ -1502,6 +1503,9 @@ async def run_single_turn_streamed(
         previous_response_id=previous_response_id,
         conversation_id=conversation_id,
         failed_retry_attempts_out=stream_failed_retry_attempts,
+        replay_unsafe_request=any(
+            isinstance(tool, ProgrammaticToolCallingTool) for tool in all_tools
+        ),
     )
 
     async for event in model_run_context_stream(retry_stream, tool_use_tracker):
@@ -1918,6 +1922,9 @@ async def get_new_response(
             get_retry_advice=model.get_retry_advice,
             previous_response_id=previous_response_id,
             conversation_id=conversation_id,
+            replay_unsafe_request=any(
+                isinstance(tool, ProgrammaticToolCallingTool) for tool in all_tools
+            ),
         )
     if server_conversation_tracker is not None:
         # Retry helpers rewind sent-input tracking before replaying a failed request. Mark the
