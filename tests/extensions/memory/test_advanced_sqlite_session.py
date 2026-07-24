@@ -3,17 +3,19 @@
 import asyncio
 import contextlib
 import json
+import logging
 import tempfile
 import threading
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 pytest.importorskip("sqlalchemy")  # Skip tests if SQLAlchemy is not installed
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 
+import agents._debug as _debug
 from agents import Agent, Runner, TResponseInputItem, function_tool
 from agents.extensions.memory import AdvancedSQLiteSession
 from agents.result import RunResult
@@ -152,6 +154,32 @@ async def test_advanced_session_basic_functionality(agent: Agent):
     assert retrieved[1].get("content") == "Hi there!"
 
     session.close()
+
+
+@pytest.mark.parametrize("redacted", [True, False])
+async def test_create_branch_logging_respects_model_data_policy(monkeypatch, redacted: bool):
+    monkeypatch.setattr(_debug, "DONT_LOG_MODEL_DATA", redacted)
+    mock_logger = Mock()
+    session = AdvancedSQLiteSession(
+        session_id="advanced_branch_logging",
+        create_tables=True,
+        logger=mock_logger,
+    )
+    secret = "SECRET_BRANCH_TURN_CONTENT"
+
+    try:
+        await session.add_items(
+            [
+                {"role": "user", "content": secret},
+                {"role": "assistant", "content": "response"},
+            ]
+        )
+        await session.create_branch_from_turn(1, "branch")
+
+        logged = str(mock_logger.debug.call_args)
+        assert (secret not in logged) is redacted
+    finally:
+        session.close()
 
 
 async def test_advanced_session_respects_custom_table_names():
@@ -1438,6 +1466,72 @@ async def test_error_handling_in_usage_tracking(usage_data: Usage):
     await session.store_run_usage(run_result)
 
 
+@pytest.mark.parametrize(
+    ("model_redacted", "tool_redacted"),
+    [(True, False), (False, True), (False, False)],
+)
+async def test_usage_tracking_failure_identity_follows_model_data_policy(
+    usage_data: Usage,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    model_redacted: bool,
+    tool_redacted: bool,
+) -> None:
+    monkeypatch.setattr(_debug, "DONT_LOG_MODEL_DATA", model_redacted)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", tool_redacted)
+    session_id = "SECRET_USAGE_SESSION_ID"
+    test_logger = logging.getLogger("advanced-sqlite-usage-failure")
+    session = AdvancedSQLiteSession(
+        session_id=session_id,
+        create_tables=True,
+        logger=test_logger,
+    )
+    secret = "SECRET_USAGE_FAILURE"
+    run_result = create_mock_run_result(usage_data)
+
+    original_record_factory = logging.getLogRecordFactory()
+
+    def application_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = original_record_factory(*args, **kwargs)
+        record.session_id = "APPLICATION_SESSION_ID"
+        return record
+
+    logging.setLogRecordFactory(application_record_factory)
+    try:
+        with (
+            patch.object(
+                session,
+                "_update_turn_usage_internal",
+                side_effect=RuntimeError(secret),
+            ),
+            caplog.at_level(logging.ERROR, logger=test_logger.name),
+        ):
+            await session.store_run_usage(run_result)
+    finally:
+        logging.setLogRecordFactory(original_record_factory)
+
+    record = next(
+        record
+        for record in caplog.records
+        if "Failed to store session usage" in record.getMessage()
+    )
+    assert record.__dict__["session_id"] == "APPLICATION_SESSION_ID"
+    if model_redacted:
+        assert record.msg == "%s"
+        assert record.args == ("Failed to store session usage",)
+        assert record.exc_info is None
+        assert "openai_agents_diagnostic_context" not in record.__dict__
+        assert secret not in caplog.text
+        assert session_id not in caplog.text
+    else:
+        assert record.__dict__["openai_agents_diagnostic_context"] == {"session_id": session_id}
+        assert record.exc_info is not None
+        assert record.exc_info[1] is not None
+        assert secret in caplog.text
+
+    session.close()
+
+
 async def test_advanced_tool_name_extraction():
     """Test advanced tool name extraction for different tool types."""
     session_id = "advanced_tool_names_test"
@@ -1619,17 +1713,18 @@ async def test_session_settings_default():
     session.close()
 
 
-async def test_session_settings_constructor():
+@pytest.mark.parametrize("use_dictionary", [False, True], ids=["class", "dictionary"])
+async def test_session_settings_constructor(use_dictionary: bool):
     """Test passing session_settings via constructor."""
     from agents.memory import SessionSettings
 
     session = AdvancedSQLiteSession(
         session_id="constructor_settings_test",
         create_tables=True,
-        session_settings=SessionSettings(limit=5),
+        session_settings={"limit": 5} if use_dictionary else SessionSettings(limit=5),
     )
 
-    assert session.session_settings is not None
+    assert isinstance(session.session_settings, SessionSettings)
     assert session.session_settings.limit == 5
 
     session.close()

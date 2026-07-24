@@ -43,6 +43,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError, model_validator
 from typing_extensions import NotRequired, ParamSpec, TypedDict
 
 from . import _debug
+from ._config_coercion import coerce_pydantic_config
 from ._tool_identity import (
     get_explicit_function_tool_namespace,
     tool_qualified_name,
@@ -53,7 +54,7 @@ from .computer import AsyncComputer, Computer
 from .editor import ApplyPatchEditor, ApplyPatchOperation
 from .exceptions import ModelBehaviorError, ToolTimeoutError, UserError
 from .function_schema import DocstringStyle, function_schema
-from .logger import logger
+from .logger import log_tool_action_warning, logger
 from .run_context import RunContextWrapper
 from .strict_schema import ensure_strict_json_schema
 from .tool_context import ToolContext
@@ -735,6 +736,22 @@ class WebSearchTool:
     indexed-only behavior where supported.
     """
 
+    if TYPE_CHECKING:
+
+        def __init__(
+            self,
+            user_location: UserLocation | None = None,
+            filters: WebSearchToolFilters | dict[str, Any] | None = None,
+            search_context_size: Literal["low", "medium", "high"] = "medium",
+            external_web_access: bool | None = None,
+        ) -> None: ...
+
+    def __post_init__(self) -> None:
+        if isinstance(self.filters, dict):
+            self.filters = coerce_pydantic_config(
+                self.filters, WebSearchToolFilters, parameter_name="web search filters"
+            )
+
     @property
     def name(self):
         return "web_search"
@@ -868,7 +885,7 @@ async def dispose_resolved_computers(*, run_context: RunContextWrapper[Any]) -> 
             if inspect.isawaitable(result):
                 await result
         except Exception as exc:
-            logger.warning("Failed to dispose computer for run context: %s", exc)
+            log_tool_action_warning(logger, "Failed to dispose computer for run context", exc)
 
 
 @dataclass

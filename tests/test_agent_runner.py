@@ -17,6 +17,7 @@ from openai.types.responses.response_output_text import AnnotationFileCitation, 
 from openai.types.responses.response_reasoning_item import ResponseReasoningItem, Summary
 from typing_extensions import TypedDict
 
+import agents._debug as _debug
 from agents import (
     Agent,
     GuardrailFunctionOutput,
@@ -2609,6 +2610,52 @@ async def test_conversation_lock_rewind_skips_when_no_snapshot() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("session_backend", ["memory", "sqlite"])
+async def test_non_streamed_model_retry_does_not_rewind_committed_session_input(
+    tmp_path: Path, session_backend: str
+) -> None:
+    model = FakeModel()
+    model.add_multiple_turn_outputs(
+        [
+            APIConnectionError(
+                message="connection error",
+                request=httpx.Request("POST", "https://example.com"),
+            ),
+            [get_text_message("done")],
+        ]
+    )
+    agent = Agent(
+        name="test",
+        model=model,
+        model_settings=ModelSettings(
+            retry=ModelRetrySettings(
+                max_retries=1,
+                policy=retry_policies.network_error(),
+            )
+        ),
+    )
+    session: CountingSession | SQLiteSession
+    if session_backend == "sqlite":
+        session = SQLiteSession("retry-session", tmp_path / "retry.sqlite3")
+        await session.add_items([get_text_input_item("previous")])
+    else:
+        session = CountingSession(history=[get_text_input_item("previous")])
+
+    try:
+        result = await Runner.run(agent, input="test", session=session)
+        saved_items = await session.get_items()
+    finally:
+        if isinstance(session, SQLiteSession):
+            session.close()
+
+    assert result.final_output == "done"
+    assert [item.get("role") for item in saved_items] == ["user", "user", "assistant"]
+    assert [item.get("content") for item in saved_items[:2]] == ["previous", "test"]
+    if isinstance(session, CountingSession):
+        assert session.pop_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_get_new_response_uses_agent_retry_settings() -> None:
     model = FakeModel()
     model.set_hardcoded_usage(Usage(requests=1))
@@ -2731,6 +2778,45 @@ async def test_rewind_handles_id_stripped_sessions() -> None:
 
     assert session.pop_calls == 1
     assert session.saved_items == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redacted", [True, False])
+async def test_rewind_debug_logging_respects_model_and_tool_policies(
+    monkeypatch, redacted: bool
+) -> None:
+    monkeypatch.setattr(_debug, "DONT_LOG_MODEL_DATA", redacted)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", redacted)
+    secret = "SECRET_REWIND_SESSION_CONTENT"
+    session = IdStrippingSession()
+    item = cast(
+        TResponseInputItem,
+        {"id": "message-1", "type": "message", "role": "user", "content": secret},
+    )
+    await session.add_items([item])
+
+    with patch("agents.run_internal.session_persistence.logger") as mock_logger:
+        await rewind_session_items(session, [item])
+
+    logged = str(mock_logger.debug.call_args_list)
+    assert (secret not in logged) is redacted
+
+
+@pytest.mark.asyncio
+async def test_rewind_failure_uses_placeholder_free_shared_logger_message() -> None:
+    class FailingTailSession(SimpleListSession):
+        async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
+            raise RuntimeError("tail failure")
+
+    item = cast(TResponseInputItem, {"type": "message", "role": "user", "content": "hi"})
+    session = FailingTailSession(history=[item])
+
+    with patch(
+        "agents.run_internal.session_persistence.log_model_and_tool_action_warning"
+    ) as mock_warning:
+        await rewind_session_items(session, [item])
+
+    assert mock_warning.call_args.args[1] == "Failed to rewind session item"
 
 
 @pytest.mark.asyncio

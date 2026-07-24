@@ -21,6 +21,7 @@ from openai.types.responses.response_input_item_param import (
 from openai.types.responses.response_input_param import McpApprovalResponse
 from openai.types.responses.response_output_item import McpApprovalRequest
 
+from .. import _debug
 from .._tool_identity import (
     FunctionToolLookupKey,
     NamedToolLookupKey,
@@ -57,7 +58,7 @@ from ..items import (
     ToolApprovalItem,
     ToolCallOutputItem,
 )
-from ..logger import logger
+from ..logger import log_tool_action_error as _log_tool_action_error, logger
 from ..model_settings import ModelSettings
 from ..run_config import RunConfig, ToolErrorFormatterArgs
 from ..run_context import RunContextWrapper
@@ -103,6 +104,7 @@ from .items import (
     extract_mcp_request_id,
     extract_mcp_request_id_from_run,
     function_rejection_item,
+    function_tool_error_output,
 )
 from .run_steps import ToolRunFunction
 from .tool_use_tracker import AgentToolUseTracker
@@ -1039,6 +1041,31 @@ def format_shell_error(error: Exception | BaseException | Any) -> str:
         return repr(error)
 
 
+def _tool_name_diagnostic_extra(tool_name: str) -> dict[str, object]:
+    return {"tool_name": tool_name}
+
+
+def log_tool_action_error(
+    message: str,
+    exc: Exception | BaseException,
+    *,
+    diagnostic_extra: Callable[[], Mapping[str, object]] | None = None,
+) -> None:
+    """Log a tool-action failure without leaking tool data.
+
+    Tool exceptions can embed tool call arguments or output, so the exception is
+    redacted by default (matching ``_debug.DONT_LOG_TOOL_DATA``). The full exception
+    and traceback are logged only when tool-data logging is explicitly enabled.
+    """
+    _log_tool_action_error(
+        logger,
+        message,
+        exc,
+        stacklevel=4,
+        diagnostic_extra=diagnostic_extra,
+    )
+
+
 async def with_tool_function_span(
     *,
     config: RunConfig,
@@ -1186,18 +1213,25 @@ async def resolve_approval_rejection_message(
         )
         message = await maybe_message if inspect.isawaitable(maybe_message) else maybe_message
     except Exception as exc:
-        logger.error("Tool error formatter failed for %s: %s", tool_name, exc)
+        log_tool_action_error(
+            "Tool error formatter failed",
+            exc,
+            diagnostic_extra=functools.partial(_tool_name_diagnostic_extra, tool_name),
+        )
         return REJECTION_MESSAGE
 
     if message is None:
         return REJECTION_MESSAGE
 
     if not isinstance(message, str):
-        logger.error(
-            "Tool error formatter returned non-string for %s: %s",
-            tool_name,
-            type(message).__name__,
-        )
+        if _debug.DONT_LOG_TOOL_DATA:
+            logger.error("Tool error formatter returned a non-string value")
+        else:
+            logger.error(
+                "Tool error formatter returned non-string for %s: %s",
+                tool_name,
+                type(message).__name__,
+            )
         return REJECTION_MESSAGE
 
     return message
@@ -1715,6 +1749,7 @@ class _FunctionToolBatchExecutor:
                             self.public_agent,
                             tool_call,
                             rejection_message=rejected_message,
+                            output_json_schema=func_tool.output_json_schema,
                             scope_id=self.tool_state_scope_id,
                             tool_origin=get_function_tool_origin(func_tool),
                         ),
@@ -1764,6 +1799,7 @@ class _FunctionToolBatchExecutor:
                 self.public_agent,
                 tool_call,
                 rejection_message=rejection_message,
+                output_json_schema=func_tool.output_json_schema,
                 scope_id=self.tool_state_scope_id,
                 tool_origin=get_function_tool_origin(func_tool),
             ),
@@ -1877,9 +1913,18 @@ class _FunctionToolBatchExecutor:
         bypass_output_schema = bypass_output_schema or (output_guardrail_result.is_rejection)
         if bypass_output_schema:
             self.schema_bypassed_tool_runs.add(id(task_state.tool_run))
+        provider_result = (
+            function_tool_error_output(
+                tool_call,
+                final_result,
+                output_json_schema=func_tool.output_json_schema,
+            )
+            if bypass_output_schema
+            else final_result
+        )
         raw_output_item = ItemHelpers.tool_call_output_item(
             tool_call,
-            final_result,
+            provider_result,
             output_json_schema=None if bypass_output_schema else func_tool.output_json_schema,
             output_type_adapter=None if bypass_output_schema else func_tool._output_type_adapter,
         )
@@ -1998,11 +2043,20 @@ class _FunctionToolBatchExecutor:
 
             run_item: RunItem | None
             if not nested_interruptions:
+                provider_result = (
+                    function_tool_error_output(
+                        tool_run.tool_call,
+                        result,
+                        output_json_schema=tool_run.function_tool.output_json_schema,
+                    )
+                    if bypass_output_schema
+                    else result
+                )
                 run_item = ToolCallOutputItem(
                     output=result,
                     raw_item=ItemHelpers.tool_call_output_item(
                         tool_run.tool_call,
-                        result,
+                        provider_result,
                         output_json_schema=(
                             None
                             if bypass_output_schema

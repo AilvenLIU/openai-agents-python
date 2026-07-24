@@ -9,6 +9,7 @@ import asyncio
 import dataclasses as _dc
 import json
 from collections.abc import Awaitable, Callable, Mapping
+from functools import partial
 from typing import Any, TypeVar, cast
 
 from openai.types.responses import (
@@ -56,7 +57,13 @@ from ..items import (
     coerce_tool_search_output_raw_item,
 )
 from ..lifecycle import RunHooks
-from ..logger import logger
+from ..logger import (
+    log_model_action_error,
+    log_model_action_warning,
+    log_model_and_tool_action_debug,
+    log_tool_action_warning,
+    logger,
+)
 from ..memory import Session
 from ..models._response_terminal import (
     response_error_event_failure_error,
@@ -270,7 +277,11 @@ async def cleanup_models_after_run(tool_use_tracker: AgentToolUseTracker) -> Non
         try:
             await model._cleanup_on_run_end(tool_use_tracker)
         except Exception as error:
-            logger.warning("Failed to clean up model resources after run: %s", error)
+            log_model_action_warning(logger, "Failed to clean up model resources after run", error)
+
+
+def _agent_diagnostic_extra(agent: Agent[Any]) -> dict[str, object]:
+    return {"agent_name": agent.name}
 
 
 def _should_attach_generic_agent_error(exc: Exception) -> bool:
@@ -398,8 +409,8 @@ async def _run_output_guardrails_for_stream(
         raise
     except asyncio.CancelledError:
         raise
-    except Exception:
-        logger.error("Unexpected error in output guardrails", exc_info=True)
+    except Exception as exc:
+        log_model_action_error(logger, "Unexpected error in output guardrails", exc)
         raise
 
 
@@ -1302,13 +1313,16 @@ async def start_streaming(
                     if first_trigger is not None:
                         raise InputGuardrailTripwireTriggered(first_trigger)
             except Exception as e:
-                logger.debug(
-                    "Error in streamed_result finalize for agent %s - %s", current_agent.name, e
+                log_model_and_tool_action_debug(
+                    logger,
+                    "Error finalizing streamed result",
+                    e,
+                    diagnostic_extra=partial(_agent_diagnostic_extra, current_agent),
                 )
         try:
             await dispose_resolved_computers(run_context=context_wrapper)
         except Exception as error:
-            logger.warning("Failed to dispose computers after streamed run: %s", error)
+            log_tool_action_warning(logger, "Failed to dispose computers after streamed run", error)
         if current_span:
             current_span.finish(reset_current=True)
         if current_task_span:
@@ -1955,9 +1969,9 @@ async def get_new_response(
     model_settings = model_settings_with_prompt_cache_key(model_settings, prompt_cache_key)
 
     async def rewind_model_request() -> None:
-        items_to_rewind = session_items_to_rewind if session_items_to_rewind is not None else []
-        await rewind_session_items(session, items_to_rewind, server_conversation_tracker)
         if server_conversation_tracker is not None:
+            items_to_rewind = session_items_to_rewind if session_items_to_rewind is not None else []
+            await rewind_session_items(session, items_to_rewind, server_conversation_tracker)
             server_conversation_tracker.rewind_input(filtered.input)
 
     with model_run_context(tool_use_tracker):
