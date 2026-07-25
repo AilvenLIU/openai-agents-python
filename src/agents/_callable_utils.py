@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
+from types import UnionType
 from typing import Annotated, Any, get_args, get_origin
 
 
@@ -58,6 +59,11 @@ def substitute_typevars(annotation: Any, substitutions: dict[Any, Any]) -> Any:
     origin = get_origin(annotation)
     if origin is None:
         return annotation
+    if origin is UnionType:
+        resolved_union = resolved_args[0]
+        for resolved_arg in resolved_args[1:]:
+            resolved_union |= resolved_arg
+        return resolved_union
     try:
         return origin[resolved_args[0] if len(resolved_args) == 1 else resolved_args]
     except TypeError:

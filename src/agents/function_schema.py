@@ -218,12 +218,38 @@ def _get_callable_signature(func: Callable[..., Any]) -> inspect.Signature:
     if inspect.isroutine(func) or inspect.isclass(func) or isinstance(func, functools.partial):
         return inspect.signature(func)
 
-    try:
-        instance_vars = vars(func)
-    except TypeError:
-        instance_vars = {}
-    if "__signature__" in instance_vars or "__wrapped__" in instance_vars:
+    if isinstance(getattr(func, "__signature__", None), inspect.Signature) or hasattr(
+        func, "__wrapped__"
+    ):
         return inspect.signature(func)
+
+    _, call_descriptor = get_callable_call_descriptor(func)
+    call_method = unwrap_callable_descriptor(call_descriptor)
+    if hasattr(call_method, "__wrapped__"):
+        resolved_signature = inspect.signature(call_method)
+        physical_signature = inspect.signature(call_method, follow_wrapped=False)
+        resolved_params = list(resolved_signature.parameters.values())
+        physical_params = list(physical_signature.parameters.values())
+
+        descriptor = call_descriptor
+        while isinstance(descriptor, functools.partialmethod):
+            descriptor = descriptor.func
+        binds_receiver = not isinstance(descriptor, staticmethod)
+        resolved_includes_receiver = (
+            binds_receiver
+            and resolved_params
+            and physical_params
+            and resolved_params[0].name == physical_params[0].name
+        )
+
+        bound_args: list[Any] = [object()] if resolved_includes_receiver else []
+        bound_kwargs: dict[str, Any] = {}
+        if isinstance(call_descriptor, functools.partialmethod):
+            bound_args.extend(call_descriptor.args)
+            bound_kwargs.update(call_descriptor.keywords or {})
+        if bound_args or bound_kwargs:
+            return inspect.signature(functools.partial(call_method, *bound_args, **bound_kwargs))
+        return resolved_signature
 
     return inspect.signature(cast(Any, func).__call__)
 
@@ -313,6 +339,19 @@ def _get_callable_type_hints(
     func: Callable[..., Any], signature: inspect.Signature
 ) -> dict[str, Any]:
     """Resolve callable hints using signature, published, wrapped, then structural metadata."""
+    partial_signature: inspect.Signature | None = None
+    partial_type_hints: dict[str, Any] | None = None
+    if isinstance(func, functools.partial):
+        partial_signature = _get_callable_signature(func.func)
+        partial_type_hints = _get_callable_type_hints(func.func, partial_signature)
+        _validate_no_positionally_bound_context(
+            partial_signature,
+            partial_type_hints,
+            positional_args=func.args,
+            implicit_positional_count=0,
+            partial_kind="functools.partial",
+        )
+
     if isinstance(getattr(func, "__signature__", None), inspect.Signature):
         return _get_signature_type_hints(func, signature)
 
@@ -352,15 +391,7 @@ def _get_callable_type_hints(
         unwrapped = inspect.unwrap(func)
         if unwrapped is not func:
             return _get_callable_type_hints(unwrapped, signature)
-        wrapped_signature = inspect.signature(func.func)
-        partial_type_hints = _get_callable_type_hints(func.func, wrapped_signature)
-        _validate_no_positionally_bound_context(
-            wrapped_signature,
-            partial_type_hints,
-            positional_args=func.args,
-            implicit_positional_count=0,
-            partial_kind="functools.partial",
-        )
+        assert partial_type_hints is not None
         return {
             name: annotation
             for name, annotation in partial_type_hints.items()

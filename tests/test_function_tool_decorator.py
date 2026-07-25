@@ -1017,6 +1017,47 @@ async def test_descriptor_callables_preserve_explicit_parameters() -> None:
 
 
 @pytest.mark.asyncio
+async def test_callable_honors_class_level_custom_signature() -> None:
+    class Handler:
+        __signature__ = inspect.Signature(
+            [
+                inspect.Parameter(
+                    "value",
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    annotation=int,
+                )
+            ],
+            return_annotation=int,
+        )
+
+        async def __call__(self, *args: Any, **kwargs: Any) -> int:
+            return cast(int, args[0])
+
+    tool = function_tool(Handler())
+
+    assert list(tool.params_json_schema["properties"]) == ["value"]
+    assert tool.params_json_schema["properties"]["value"]["type"] == "integer"
+    assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == 4
+
+
+@pytest.mark.asyncio
+async def test_callable_preserves_wrapped_call_parameters() -> None:
+    def target(value: int) -> int:
+        return value * 2
+
+    class Handler:
+        @functools.wraps(target)
+        async def __call__(self, *args: Any, **kwargs: Any) -> int:
+            return target(*args, **kwargs)
+
+    tool = function_tool(Handler())
+
+    assert list(tool.params_json_schema["properties"]) == ["value"]
+    assert tool.params_json_schema["properties"]["value"]["type"] == "integer"
+    assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == 8
+
+
+@pytest.mark.asyncio
 async def test_concrete_inherited_generic_callable_applies_specialization() -> None:
     class BaseHandler(Generic[CallableValueT]):
         async def __call__(self, value: CallableValueT) -> CallableValueT:
@@ -1029,6 +1070,23 @@ async def test_concrete_inherited_generic_callable_applies_specialization() -> N
 
     assert tool.params_json_schema["properties"]["value"]["type"] == "integer"
     assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == 4
+
+
+@pytest.mark.asyncio
+async def test_generic_callable_specializes_nested_pep604_union() -> None:
+    class Handler(Generic[CallableValueT]):
+        async def __call__(
+            self,
+            values: list[CallableValueT] | None,
+        ) -> list[CallableValueT] | None:
+            return values
+
+    tool = function_tool(Handler[int]())
+
+    values_schema = tool.params_json_schema["properties"]["values"]
+    array_schema = next(item for item in values_schema["anyOf"] if item.get("type") == "array")
+    assert array_schema["items"]["type"] == "integer"
+    assert await tool.on_invoke_tool(ctx_wrapper(), '{"values": [4]}') == [4]
 
 
 @pytest.mark.asyncio
@@ -1046,6 +1104,17 @@ async def test_generic_callable_specialization_preserves_annotated_metadata() ->
     assert value_schema["type"] == "integer"
     assert value_schema["description"] == "Specialized value"
     assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == 4
+
+
+def test_partial_wrapper_cannot_bypass_bound_context_validation() -> None:
+    def handler(ctx: ToolContext[DummyContext], value: int) -> str:
+        return f"{ctx.context.data}:{value}"
+
+    wrapped_partial = functools.partial(handler, ctx_wrapper())
+    functools.update_wrapper(wrapped_partial, handler)
+
+    with pytest.raises(UserError, match="cannot positionally bind"):
+        function_tool(wrapped_partial)
 
 
 @pytest.mark.asyncio
