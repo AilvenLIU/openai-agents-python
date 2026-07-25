@@ -6,6 +6,7 @@ import inspect
 import logging
 import re
 import sys
+import typing
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, cast, get_args, get_origin, get_type_hints
@@ -14,6 +15,7 @@ from typing import Annotated, Any, Literal, cast, get_args, get_origin, get_type
 from griffe import Docstring, DocstringSectionKind  # type: ignore[import-untyped]
 from pydantic import BaseModel, Field, create_model
 from pydantic.fields import FieldInfo
+from typing_extensions import Self
 
 from ._callable_utils import (
     get_callable_call_descriptor,
@@ -30,6 +32,7 @@ from .tool_context import ToolContext
 _CONTEXT_NOT_PROVIDED = object()
 _IMPLICIT_POSITIONAL_ARG = object()
 _PARTIAL_PLACEHOLDER = getattr(functools, "Placeholder", object())
+_NATIVE_SELF = getattr(typing, "Self", Self)
 
 
 @dataclass
@@ -223,23 +226,29 @@ def _get_callable_signature(func: Callable[..., Any]) -> inspect.Signature:
     ):
         return inspect.signature(func)
 
-    _, call_descriptor = get_callable_call_descriptor(func)
+    call_owner, call_descriptor = get_callable_call_descriptor(func)
     call_method = unwrap_callable_descriptor(call_descriptor)
+    if isinstance(call_descriptor, functools.singledispatchmethod):
+        return inspect.signature(functools.partial(call_method, object()))
     if hasattr(call_method, "__wrapped__"):
         resolved_signature = inspect.signature(call_method)
-        physical_signature = inspect.signature(call_method, follow_wrapped=False)
         resolved_params = list(resolved_signature.parameters.values())
-        physical_params = list(physical_signature.parameters.values())
 
         descriptor = call_descriptor
         while isinstance(descriptor, functools.partialmethod):
             descriptor = descriptor.func
         binds_receiver = not isinstance(descriptor, staticmethod)
+        first_annotation = (
+            resolved_params[0].annotation if resolved_params else inspect.Signature.empty
+        )
         resolved_includes_receiver = (
             binds_receiver
             and resolved_params
-            and physical_params
-            and resolved_params[0].name == physical_params[0].name
+            and (
+                resolved_params[0].name in ("self", "cls")
+                or first_annotation in (Self, _NATIVE_SELF, call_owner)
+                or first_annotation in ("Self", call_owner.__name__)
+            )
         )
 
         bound_args: list[Any] = [object()] if resolved_includes_receiver else []
@@ -252,6 +261,24 @@ def _get_callable_signature(func: Callable[..., Any]) -> inspect.Signature:
         return resolved_signature
 
     return inspect.signature(cast(Any, func).__call__)
+
+
+def _get_callable_protocol_owner(
+    func: Callable[..., Any],
+    attribute: str,
+) -> type[Any] | None:
+    """Return the class that publishes a callable protocol attribute."""
+    if inspect.isroutine(func) or inspect.isclass(func):
+        return None
+    try:
+        if attribute in vars(func):
+            return type(func)
+    except TypeError:
+        pass
+    return next(
+        (owner for owner in type(func).__mro__ if attribute in owner.__dict__),
+        None,
+    )
 
 
 def _get_signature_type_hints(
@@ -272,7 +299,10 @@ def _get_signature_type_hints(
         pass
 
     annotation_source.__annotations__ = annotations
-    globalns, localns = _get_callable_annotation_namespaces(func)
+    globalns, localns = _get_callable_annotation_namespaces(
+        func,
+        local_owner=_get_callable_protocol_owner(func, "__signature__"),
+    )
     resolved_hints = get_type_hints(
         annotation_source,
         globalns=globalns,
@@ -285,6 +315,8 @@ def _get_signature_type_hints(
 
 def _get_callable_annotation_namespaces(
     func: Callable[..., Any],
+    *,
+    local_owner: type[Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return globals and locals that own a callable's published annotations."""
     namespace_source: Any = func
@@ -298,12 +330,11 @@ def _get_callable_annotation_namespaces(
     if wrapper_globalns is not None:
         globalns.update(wrapper_globalns)
 
-    if inspect.isclass(namespace_source):
-        local_owner: type[Any] | None = namespace_source
-    elif inspect.isroutine(namespace_source):
-        local_owner = None
-    else:
-        local_owner = type(namespace_source)
+    if local_owner is None:
+        if inspect.isclass(namespace_source):
+            local_owner = namespace_source
+        elif not inspect.isroutine(namespace_source):
+            local_owner = type(namespace_source)
 
     localns: dict[str, Any] = {}
     if local_owner is not None:
@@ -327,8 +358,12 @@ def _apply_callable_type_specialization(
     substitutions = resolve_typevar_substitutions(specialization, owner)
     if not substitutions:
         substitutions = resolve_typevar_substitutions(type(func), owner)
-    if not substitutions:
-        return type_hints
+    self_owner = func if inspect.isclass(func) else type(func)
+    substitutions = {
+        Self: self_owner,
+        _NATIVE_SELF: self_owner,
+        **substitutions,
+    }
     return {
         name: substitute_typevars(annotation, substitutions)
         for name, annotation in type_hints.items()

@@ -21,12 +21,14 @@ def get_callable_call_descriptor(func: Callable[..., Any]) -> tuple[type[Any], A
 
 
 def unwrap_callable_descriptor(descriptor: Any) -> Any:
-    """Return the callable behind method and partialmethod descriptors."""
-    while isinstance(descriptor, classmethod | staticmethod):
-        descriptor = descriptor.__func__
-    if isinstance(descriptor, functools.partialmethod):
-        return unwrap_callable_descriptor(descriptor.func)
-    return descriptor
+    """Return the callable behind supported method descriptors."""
+    while True:
+        if isinstance(descriptor, classmethod | staticmethod):
+            descriptor = descriptor.__func__
+        elif isinstance(descriptor, functools.partialmethod | functools.singledispatchmethod):
+            descriptor = descriptor.func
+        else:
+            return descriptor
 
 
 def substitute_typevars(annotation: Any, substitutions: dict[Any, Any]) -> Any:
@@ -79,10 +81,23 @@ def resolve_typevar_substitutions(
     if not isinstance(specialization_origin, type):
         return {}
 
+    specialization_args = get_args(specialization)
+    pydantic_metadata = getattr(
+        specialization_origin,
+        "__pydantic_generic_metadata__",
+        None,
+    )
+    if isinstance(pydantic_metadata, dict):
+        pydantic_origin = pydantic_metadata.get("origin")
+        pydantic_args = pydantic_metadata.get("args")
+        if isinstance(pydantic_origin, type) and isinstance(pydantic_args, tuple):
+            specialization_origin = pydantic_origin
+            specialization_args = pydantic_args
+
     initial_substitutions = dict(
         zip(
             get_type_parameters(specialization_origin),
-            get_args(specialization),
+            specialization_args,
             strict=False,
         )
     )

@@ -12,6 +12,7 @@ from typing import Annotated, Any, Generic, TypeVar, cast
 import pytest
 from inline_snapshot import snapshot
 from pydantic import BaseModel, Field
+from typing_extensions import Self
 
 from agents import UserError, function_tool
 from agents.run_context import RunContextWrapper
@@ -1041,6 +1042,37 @@ async def test_callable_honors_class_level_custom_signature() -> None:
 
 
 @pytest.mark.asyncio
+async def test_callable_resolves_inherited_signature_owner_locals() -> None:
+    class BaseHandler:
+        class Payload(BaseModel):
+            value: int
+
+        __signature__ = inspect.Signature(
+            [
+                inspect.Parameter(
+                    "payload",
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    annotation="Payload",
+                )
+            ]
+        )
+
+        async def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            return args[0]
+
+    class Handler(BaseHandler):
+        pass
+
+    tool = function_tool(Handler())
+
+    assert tool.params_json_schema["properties"]["payload"]["$ref"] == "#/$defs/Payload"
+    assert await tool.on_invoke_tool(
+        ctx_wrapper(),
+        '{"payload": {"value": 4}}',
+    ) == BaseHandler.Payload(value=4)
+
+
+@pytest.mark.asyncio
 async def test_callable_preserves_wrapped_call_parameters() -> None:
     def target(value: int) -> int:
         return value * 2
@@ -1049,6 +1081,57 @@ async def test_callable_preserves_wrapped_call_parameters() -> None:
         @functools.wraps(target)
         async def __call__(self, *args: Any, **kwargs: Any) -> int:
             return target(*args, **kwargs)
+
+    tool = function_tool(Handler())
+
+    assert list(tool.params_json_schema["properties"]) == ["value"]
+    assert tool.params_json_schema["properties"]["value"]["type"] == "integer"
+    assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == 8
+
+
+@pytest.mark.asyncio
+async def test_callable_binds_receiver_from_wrapped_target_method() -> None:
+    class Target:
+        def invoke(self, value: int) -> int:
+            return value * 2
+
+    class Handler:
+        @functools.wraps(Target.invoke)
+        async def __call__(*args: Any, **kwargs: Any) -> int:
+            return Target.invoke(*args, **kwargs)
+
+    tool = function_tool(Handler())
+
+    assert list(tool.params_json_schema["properties"]) == ["value"]
+    assert tool.params_json_schema["properties"]["value"]["type"] == "integer"
+    assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == 8
+
+
+@pytest.mark.asyncio
+async def test_callable_resolves_self_annotations() -> None:
+    class Handler(BaseModel):
+        value: int
+
+        async def __call__(self, other: Self) -> Self:
+            return other
+
+    tool = function_tool(Handler(value=1), allowed_callers=["programmatic"])
+
+    assert tool.params_json_schema["properties"]["other"]["$ref"] == "#/$defs/Handler"
+    assert tool.output_json_schema is not None
+    assert tool.output_json_schema["title"] == "Handler"
+    assert await tool.on_invoke_tool(
+        ctx_wrapper(),
+        '{"other": {"value": 4}}',
+    ) == Handler(value=4)
+
+
+@pytest.mark.asyncio
+async def test_singledispatchmethod_callable_uses_underlying_contract() -> None:
+    class Handler:
+        @functools.singledispatchmethod
+        async def __call__(self, value: int) -> int:
+            return value * 2
 
     tool = function_tool(Handler())
 
@@ -1070,6 +1153,26 @@ async def test_concrete_inherited_generic_callable_applies_specialization() -> N
 
     assert tool.params_json_schema["properties"]["value"]["type"] == "integer"
     assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == 4
+
+
+@pytest.mark.asyncio
+async def test_pydantic_generic_callable_applies_specialization() -> None:
+    class Handler(BaseModel, Generic[CallableValueT]):
+        async def __call__(self, value: CallableValueT) -> CallableValueT:
+            return value
+
+    tool = function_tool(
+        Handler[WrappedPayload](),
+        allowed_callers=["programmatic"],
+    )
+
+    assert tool.params_json_schema["properties"]["value"]["$ref"] == "#/$defs/WrappedPayload"
+    assert tool.output_json_schema is not None
+    assert tool.output_json_schema["title"] == "WrappedPayload"
+    assert await tool.on_invoke_tool(
+        ctx_wrapper(),
+        '{"value": {"value": 4}}',
+    ) == WrappedPayload(value=4)
 
 
 @pytest.mark.asyncio
