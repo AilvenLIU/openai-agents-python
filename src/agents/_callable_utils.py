@@ -1,9 +1,47 @@
 from __future__ import annotations
 
 import functools
+import typing
 from collections.abc import Callable
 from types import UnionType
 from typing import Annotated, Any, get_args, get_origin
+
+from typing_extensions import TypeAliasType
+
+_NATIVE_TYPE_ALIAS_TYPE = getattr(typing, "TypeAliasType", TypeAliasType)
+
+
+def is_type_alias_type(value: Any) -> bool:
+    """Return whether a value is a native or typing-extensions PEP 695 alias."""
+    return isinstance(value, TypeAliasType | _NATIVE_TYPE_ALIAS_TYPE)
+
+
+def expand_type_alias(annotation: Any, seen: set[Any] | None = None) -> Any:
+    """Expand PEP 695 aliases while preserving outer ``Annotated`` metadata."""
+    metadata: list[Any] = []
+    plain_annotation = annotation
+    while get_origin(plain_annotation) is Annotated:
+        annotated_args = get_args(plain_annotation)
+        if not annotated_args:
+            break
+        plain_annotation = annotated_args[0]
+        metadata.extend(annotated_args[1:])
+
+    origin = get_origin(plain_annotation)
+    alias = origin if is_type_alias_type(origin) else plain_annotation
+    if not is_type_alias_type(alias):
+        return annotation
+
+    seen_aliases = seen or set()
+    if alias in seen_aliases:
+        return annotation
+
+    parameters = get_type_parameters(alias)
+    args = get_args(plain_annotation) or (Any,) * len(parameters)
+    substitutions = dict(zip(parameters, args, strict=False))
+    expanded = substitute_typevars(alias.__value__, substitutions)
+    expanded = expand_type_alias(expanded, {*seen_aliases, alias})
+    return Annotated[(expanded, *metadata)] if metadata else expanded
 
 
 def get_type_parameters(owner: Any) -> tuple[Any, ...]:

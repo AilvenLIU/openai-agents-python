@@ -460,7 +460,7 @@ def test_callable_contract_conformance_matrix() -> None:
             SingleDispatchCallable(),
             "call_descriptor",
             "call_descriptor",
-            False,
+            True,
             ["value"],
         ),
     ]
@@ -1351,6 +1351,57 @@ async def test_partialmethod_applies_bindings_around_singledispatchmethod() -> N
         tool = function_tool(cast(Callable[..., Any], handler))
         assert list(tool.params_json_schema["properties"]) == ["value"]
         assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == expected
+
+
+def test_nested_partialmethod_cannot_positionally_bind_context() -> None:
+    captured_context = ctx_wrapper()
+
+    class Handler:
+        def handle(self, ctx: ToolContext[DummyContext], value: int) -> str:
+            return f"{ctx.context.data}:{value}"
+
+        __call__: Any = functools.singledispatchmethod(
+            functools.partialmethod(handle, captured_context)
+        )
+
+    with pytest.raises(UserError, match="positionally bind"):
+        function_tool(Handler())
+
+
+@pytest.mark.asyncio
+async def test_async_only_singledispatchmethod_supports_timeout() -> None:
+    class Handler:
+        @functools.singledispatchmethod
+        async def __call__(self, value: int) -> int:
+            await asyncio.sleep(0)
+            return value * 2
+
+    tool = function_tool(Handler(), timeout=1)
+
+    assert tool.timeout_seconds == 1
+    assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == 8
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 requires Python 3.12")
+@pytest.mark.asyncio
+async def test_pep695_alias_context_is_injected() -> None:
+    namespace: dict[str, Any] = {
+        "DummyContext": DummyContext,
+        "ToolContext": ToolContext,
+    }
+    exec(
+        "type LiveContext[T] = ToolContext[T]\n"
+        "async def handler(ctx: LiveContext[DummyContext], value: int) -> str:\n"
+        "    return f'{ctx.context.data}:{value}'\n",
+        namespace,
+    )
+    live_context = ctx_wrapper()
+    live_context.context.data = "live"
+
+    tool = function_tool(namespace["handler"])
+
+    assert list(tool.params_json_schema["properties"]) == ["value"]
+    assert await tool.on_invoke_tool(live_context, '{"value": 4}') == "live:4"
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,7 @@ from pydantic.fields import FieldInfo
 from typing_extensions import Self
 
 from ._callable_utils import (
+    expand_type_alias,
     get_callable_call_descriptor,
     get_type_parameters,
     resolve_typevar_substitutions,
@@ -165,7 +166,9 @@ class _CallableDescriptorPlan:
     binds_receiver: bool
     partial_args: tuple[Any, ...]
     partial_keywords: dict[str, Any]
+    has_partialmethod: bool
     dispatches_dynamically: bool
+    dispatches_async_only: bool
 
 
 @dataclass(frozen=True)
@@ -202,6 +205,7 @@ class _ResolvedCallableAnnotations:
 
 def _is_context_annotation(annotation: Any) -> bool:
     """Return whether an annotation denotes an injected function-tool context."""
+    annotation = expand_type_alias(annotation)
     while get_origin(annotation) is Annotated:
         args = get_args(annotation)
         if not args:
@@ -310,16 +314,23 @@ def _resolve_callable_descriptor_plan(descriptor: Any) -> _CallableDescriptorPla
     """Normalize supported descriptor wrappers into one invocation binding plan."""
     partial_args: list[Any] = []
     partial_keywords: dict[str, Any] = {}
+    has_partialmethod = False
     dispatches_dynamically = False
+    dispatches_async_only = True
     binds_receiver = True
 
     while True:
         if isinstance(descriptor, functools.partialmethod):
+            has_partialmethod = True
             partial_args.extend(descriptor.args)
             partial_keywords.update(descriptor.keywords or {})
             descriptor = descriptor.func
         elif isinstance(descriptor, functools.singledispatchmethod):
             dispatches_dynamically = True
+            dispatches_async_only = dispatches_async_only and all(
+                inspect.iscoroutinefunction(unwrap_callable_descriptor(implementation))
+                for implementation in descriptor.dispatcher.registry.values()
+            )
             descriptor = descriptor.func
         elif isinstance(descriptor, staticmethod):
             binds_receiver = False
@@ -335,7 +346,9 @@ def _resolve_callable_descriptor_plan(descriptor: Any) -> _CallableDescriptorPla
         binds_receiver=binds_receiver,
         partial_args=tuple(partial_args),
         partial_keywords=partial_keywords,
+        has_partialmethod=has_partialmethod,
         dispatches_dynamically=dispatches_dynamically,
+        dispatches_async_only=dispatches_async_only,
     )
 
 
@@ -641,12 +654,12 @@ def _get_callable_type_hints(
         func,
         call_owner,
     )
-    if isinstance(call_descriptor, functools.partialmethod):
+    if descriptor_plan.has_partialmethod:
         implicit_positional_count = 1 if descriptor_plan.binds_receiver else 0
         _validate_no_positionally_bound_context(
             inspect.signature(call_method),
             call_type_hints,
-            positional_args=call_descriptor.args,
+            positional_args=descriptor_plan.partial_args,
             implicit_positional_count=implicit_positional_count,
             partial_kind="functools.partialmethod",
         )
@@ -741,7 +754,11 @@ def resolve_callable_contract(func: Callable[..., Any]) -> ResolvedCallableContr
         invocation_mode = (
             "async"
             if is_direct_async
-            and not (descriptor_plan is not None and descriptor_plan.dispatches_dynamically)
+            and (
+                descriptor_plan is None
+                or not descriptor_plan.dispatches_dynamically
+                or descriptor_plan.dispatches_async_only
+            )
             else "threaded"
         )
         resolved_call_owner = call_owner

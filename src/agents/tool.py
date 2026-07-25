@@ -7,7 +7,6 @@ import dataclasses
 import inspect
 import json
 import math
-import typing
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
@@ -41,11 +40,13 @@ from openai.types.responses.tool_param import CodeInterpreter, ImageGeneration, 
 from openai.types.responses.web_search_tool import Filters as WebSearchToolFilters
 from openai.types.responses.web_search_tool_param import UserLocation
 from pydantic import BaseModel, TypeAdapter, ValidationError, model_validator
-from typing_extensions import NotRequired, ParamSpec, TypeAliasType, TypedDict
+from typing_extensions import NotRequired, ParamSpec, TypedDict
 
 from . import _debug
 from ._callable_utils import (
+    expand_type_alias,
     get_type_parameters,
+    is_type_alias_type,
     substitute_typevars,
 )
 from ._config_coercion import coerce_pydantic_config
@@ -2155,43 +2156,17 @@ def _split_annotated_type(annotation: Any) -> tuple[Any, tuple[Any, ...]]:
 
 
 _UNRESOLVED_AWAITABLE_TYPE = object()
-_NATIVE_TYPE_ALIAS_TYPE = getattr(typing, "TypeAliasType", TypeAliasType)
-
-
-def _is_type_alias_type(value: Any) -> bool:
-    """Return whether a value is a native or typing-extensions PEP 695 alias."""
-    return isinstance(value, TypeAliasType | _NATIVE_TYPE_ALIAS_TYPE)
-
-
-def _expand_type_alias(annotation: Any, seen: set[Any] | None = None) -> Any:
-    """Expand PEP 695 aliases while preserving annotations outside the alias."""
-    plain_annotation, metadata = _split_annotated_type(annotation)
-    origin = get_origin(plain_annotation)
-    alias = origin if _is_type_alias_type(origin) else plain_annotation
-    if not _is_type_alias_type(alias):
-        return annotation
-
-    seen_aliases = seen or set()
-    if alias in seen_aliases:
-        return annotation
-
-    parameters = get_type_parameters(alias)
-    args = get_args(plain_annotation) or (Any,) * len(parameters)
-    substitutions = dict(zip(parameters, args, strict=False))
-    expanded = substitute_typevars(alias.__value__, substitutions)
-    expanded = _expand_type_alias(expanded, {*seen_aliases, alias})
-    return Annotated[(expanded, *metadata)] if metadata else expanded
 
 
 def _resolve_awaitable_value_type(annotation: Any) -> Any:
     """Resolve the value type supplied to an annotation's Awaitable base."""
 
     def resolve_base(origin: Any, args: tuple[Any, ...], seen: set[Any]) -> Any:
-        if _is_type_alias_type(origin):
+        if is_type_alias_type(origin):
             if origin in seen:
                 return _UNRESOLVED_AWAITABLE_TYPE
             alias_annotation = origin[args[0] if len(args) == 1 else args] if args else origin
-            expanded = _expand_type_alias(alias_annotation, seen)
+            expanded = expand_type_alias(alias_annotation, seen)
             expanded, _ = _split_annotated_type(expanded)
             return resolve_base(
                 get_origin(expanded) or expanded,
@@ -2222,7 +2197,7 @@ def _resolve_awaitable_value_type(annotation: Any) -> Any:
             return resolved_args[0]
         return Any if not resolved_args else _UNRESOLVED_AWAITABLE_TYPE
 
-    plain_annotation, _ = _split_annotated_type(_expand_type_alias(annotation))
+    plain_annotation, _ = _split_annotated_type(expand_type_alias(annotation))
     return resolve_base(
         get_origin(plain_annotation) or plain_annotation,
         get_args(plain_annotation),
@@ -2232,7 +2207,7 @@ def _resolve_awaitable_value_type(annotation: Any) -> Any:
 
 def _unwrap_awaitable_return_type(annotation: Any) -> Any:
     """Return an awaitable annotation's value type while preserving outer metadata."""
-    annotation = _expand_type_alias(annotation)
+    annotation = expand_type_alias(annotation)
     plain_annotation, metadata = _split_annotated_type(annotation)
     origin = get_origin(plain_annotation)
     args = get_args(plain_annotation)
