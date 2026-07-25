@@ -8,6 +8,7 @@ import functools
 import inspect
 import json
 import math
+import typing
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
@@ -2153,14 +2154,20 @@ def _split_annotated_type(annotation: Any) -> tuple[Any, tuple[Any, ...]]:
 
 
 _UNRESOLVED_AWAITABLE_TYPE = object()
+_NATIVE_TYPE_ALIAS_TYPE = getattr(typing, "TypeAliasType", TypeAliasType)
+
+
+def _is_type_alias_type(value: Any) -> bool:
+    """Return whether a value is a native or typing-extensions PEP 695 alias."""
+    return isinstance(value, TypeAliasType | _NATIVE_TYPE_ALIAS_TYPE)
 
 
 def _expand_type_alias(annotation: Any, seen: set[Any] | None = None) -> Any:
     """Expand PEP 695 aliases while preserving annotations outside the alias."""
     plain_annotation, metadata = _split_annotated_type(annotation)
     origin = get_origin(plain_annotation)
-    alias = origin if isinstance(origin, TypeAliasType) else plain_annotation
-    if not isinstance(alias, TypeAliasType):
+    alias = origin if _is_type_alias_type(origin) else plain_annotation
+    if not _is_type_alias_type(alias):
         return annotation
 
     seen_aliases = seen or set()
@@ -2179,7 +2186,7 @@ def _resolve_awaitable_value_type(annotation: Any) -> Any:
     """Resolve the value type supplied to an annotation's Awaitable base."""
 
     def resolve_base(origin: Any, args: tuple[Any, ...], seen: set[Any]) -> Any:
-        if isinstance(origin, TypeAliasType):
+        if _is_type_alias_type(origin):
             if origin in seen:
                 return _UNRESOLVED_AWAITABLE_TYPE
             alias_annotation = origin[args[0] if len(args) == 1 else args] if args else origin

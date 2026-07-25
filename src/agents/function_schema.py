@@ -8,7 +8,7 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, Literal, cast, get_args, get_origin, get_type_hints
 
 # griffelib exposes the `griffe` package at runtime but currently does not ship typing markers.
 from griffe import Docstring, DocstringSectionKind  # type: ignore[import-untyped]
@@ -225,7 +225,7 @@ def _get_callable_signature(func: Callable[..., Any]) -> inspect.Signature:
     if "__signature__" in instance_vars or "__wrapped__" in instance_vars:
         return inspect.signature(func)
 
-    return inspect.signature(func.__call__)
+    return inspect.signature(cast(Any, func).__call__)
 
 
 def _get_signature_type_hints(
