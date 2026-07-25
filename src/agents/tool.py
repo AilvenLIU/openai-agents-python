@@ -4,11 +4,12 @@ import ast
 import asyncio
 import copy
 import dataclasses
+import functools
 import inspect
 import json
 import math
 import weakref
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import UnionType
@@ -40,9 +41,15 @@ from openai.types.responses.tool_param import CodeInterpreter, ImageGeneration, 
 from openai.types.responses.web_search_tool import Filters as WebSearchToolFilters
 from openai.types.responses.web_search_tool_param import UserLocation
 from pydantic import BaseModel, TypeAdapter, ValidationError, model_validator
-from typing_extensions import NotRequired, ParamSpec, TypedDict
+from typing_extensions import NotRequired, ParamSpec, TypeAliasType, TypedDict
 
 from . import _debug
+from ._callable_utils import (
+    get_callable_call_descriptor,
+    get_type_parameters,
+    substitute_typevars,
+    unwrap_callable_descriptor,
+)
 from ._config_coercion import coerce_pydantic_config
 from ._tool_identity import (
     get_explicit_function_tool_namespace,
@@ -2130,17 +2137,128 @@ def _build_function_tool_output_type(
 
 def _unwrap_annotated_type(annotation: Any) -> Any:
     """Return the underlying type while ignoring Annotated metadata."""
+    return _split_annotated_type(annotation)[0]
+
+
+def _split_annotated_type(annotation: Any) -> tuple[Any, tuple[Any, ...]]:
+    """Return an Annotated type's underlying type and flattened metadata."""
+    metadata: list[Any] = []
     while get_origin(annotation) is Annotated:
         args = get_args(annotation)
         if not args:
             break
         annotation = args[0]
+        metadata.extend(args[1:])
+    return annotation, tuple(metadata)
+
+
+_UNRESOLVED_AWAITABLE_TYPE = object()
+
+
+def _expand_type_alias(annotation: Any, seen: set[Any] | None = None) -> Any:
+    """Expand PEP 695 aliases while preserving annotations outside the alias."""
+    plain_annotation, metadata = _split_annotated_type(annotation)
+    origin = get_origin(plain_annotation)
+    alias = origin if isinstance(origin, TypeAliasType) else plain_annotation
+    if not isinstance(alias, TypeAliasType):
+        return annotation
+
+    seen_aliases = seen or set()
+    if alias in seen_aliases:
+        return annotation
+
+    parameters = get_type_parameters(alias)
+    args = get_args(plain_annotation) or (Any,) * len(parameters)
+    substitutions = dict(zip(parameters, args, strict=False))
+    expanded = substitute_typevars(alias.__value__, substitutions)
+    expanded = _expand_type_alias(expanded, {*seen_aliases, alias})
+    return Annotated[(expanded, *metadata)] if metadata else expanded
+
+
+def _resolve_awaitable_value_type(annotation: Any) -> Any:
+    """Resolve the value type supplied to an annotation's Awaitable base."""
+
+    def resolve_base(origin: Any, args: tuple[Any, ...], seen: set[Any]) -> Any:
+        if isinstance(origin, TypeAliasType):
+            if origin in seen:
+                return _UNRESOLVED_AWAITABLE_TYPE
+            alias_annotation = origin[args[0] if len(args) == 1 else args] if args else origin
+            expanded = _expand_type_alias(alias_annotation, seen)
+            expanded, _ = _split_annotated_type(expanded)
+            return resolve_base(
+                get_origin(expanded) or expanded,
+                get_args(expanded),
+                {*seen, origin},
+            )
+        if origin is Awaitable:
+            return args[0] if args else Any
+        if origin is Coroutine:
+            return args[-1] if args else Any
+        if origin in seen:
+            return _UNRESOLVED_AWAITABLE_TYPE
+        if not isinstance(origin, type) or not issubclass(origin, Awaitable):
+            return _UNRESOLVED_AWAITABLE_TYPE
+
+        next_seen = {*seen, origin}
+        parameters = get_type_parameters(origin)
+        resolved_args = args or (Any,) * len(parameters)
+        substitutions = dict(zip(parameters, resolved_args, strict=False))
+        for base in getattr(origin, "__orig_bases__", ()):
+            base_origin = get_origin(base) or base
+            base_args = tuple(substitute_typevars(arg, substitutions) for arg in get_args(base))
+            resolved = resolve_base(base_origin, base_args, next_seen)
+            if resolved is not _UNRESOLVED_AWAITABLE_TYPE:
+                return resolved
+
+        if len(resolved_args) == 1:
+            return resolved_args[0]
+        return Any if not resolved_args else _UNRESOLVED_AWAITABLE_TYPE
+
+    plain_annotation, _ = _split_annotated_type(_expand_type_alias(annotation))
+    return resolve_base(
+        get_origin(plain_annotation) or plain_annotation,
+        get_args(plain_annotation),
+        set(),
+    )
+
+
+def _unwrap_awaitable_return_type(annotation: Any) -> Any:
+    """Return an awaitable annotation's value type while preserving outer metadata."""
+    annotation = _expand_type_alias(annotation)
+    plain_annotation, metadata = _split_annotated_type(annotation)
+    origin = get_origin(plain_annotation)
+    args = get_args(plain_annotation)
+    if origin in (Union, UnionType):
+        normalized_args: list[Any] = []
+        for arg in args:
+            normalized_arg = _unwrap_awaitable_return_type(arg)
+            if normalized_arg not in normalized_args:
+                normalized_args.append(normalized_arg)
+
+        normalized_annotation = normalized_args[0]
+        for normalized_arg in normalized_args[1:]:
+            normalized_annotation = normalized_annotation | normalized_arg
+        return Annotated[(normalized_annotation, *metadata)] if metadata else normalized_annotation
+    awaited_type = _resolve_awaitable_value_type(plain_annotation)
+    if awaited_type is not _UNRESOLVED_AWAITABLE_TYPE:
+        return Annotated[(awaited_type, *metadata)] if metadata else awaited_type
     return annotation
+
+
+def _is_async_function_tool_callable(func: Callable[..., Any]) -> bool:
+    """Return whether a callable should use the async function-tool invocation path."""
+    if isinstance(func, functools.partial):
+        return _is_async_function_tool_callable(func.func)
+    if inspect.iscoroutinefunction(func):
+        return True
+    _, call_descriptor = get_callable_call_descriptor(func)
+    return inspect.iscoroutinefunction(unwrap_callable_descriptor(call_descriptor))
 
 
 def _resolve_function_tool_output(
     *,
     return_annotation: Any,
+    unwrap_awaitable: bool,
     allowed_callers: list[ToolCaller] | None,
     output_type: Any | None,
     output_json_schema: dict[str, Any] | None,
@@ -2158,7 +2276,10 @@ def _resolve_function_tool_output(
     if allowed_callers is None or "programmatic" not in allowed_callers:
         return None, None
 
-    plain_return_annotation = _unwrap_annotated_type(return_annotation)
+    resolved_return_annotation = (
+        _unwrap_awaitable_return_type(return_annotation) if unwrap_awaitable else return_annotation
+    )
+    plain_return_annotation = _unwrap_annotated_type(resolved_return_annotation)
     if (
         plain_return_annotation is inspect.Signature.empty
         or plain_return_annotation is Any
@@ -2169,7 +2290,7 @@ def _resolve_function_tool_output(
         return None, None
 
     try:
-        return _build_function_tool_output_type(return_annotation)
+        return _build_function_tool_output_type(resolved_return_annotation)
     except UserError as error:
         raise UserError(
             "A programmatic function tool return annotation must define a strict JSON object "
@@ -2330,7 +2451,7 @@ def function_tool(
     """
 
     def _create_function_tool(the_func: ToolFunction[...]) -> FunctionTool:
-        is_sync_function_tool = not inspect.iscoroutinefunction(the_func)
+        is_sync_function_tool = not _is_async_function_tool_callable(the_func)
         schema = function_schema(
             func=the_func,
             name_override=name_override,
@@ -2341,6 +2462,7 @@ def function_tool(
         )
         resolved_output_json_schema, output_type_adapter = _resolve_function_tool_output(
             return_annotation=schema.return_annotation,
+            unwrap_awaitable=is_sync_function_tool,
             allowed_callers=allowed_callers,
             output_type=output_type,
             output_json_schema=output_json_schema,
@@ -2360,21 +2482,17 @@ def function_tool(
             except ValidationError as e:
                 raise ModelBehaviorError(f"Invalid JSON input for tool {tool_name}: {e}") from e
 
-            args, kwargs_dict = schema.to_call_args(parsed)
-
             if not _debug.DONT_LOG_TOOL_DATA:
-                logger.debug("Tool call args: %s, kwargs: %s", args, kwargs_dict)
+                logged_args, logged_kwargs = schema.to_call_args(parsed)
+                logger.debug("Tool call args: %s, kwargs: %s", logged_args, logged_kwargs)
 
+            args, kwargs_dict = schema.to_call_args(parsed, context=ctx)
             if not is_sync_function_tool:
-                if schema.takes_context:
-                    result = await the_func(ctx, *args, **kwargs_dict)
-                else:
-                    result = await the_func(*args, **kwargs_dict)
+                result = await the_func(*args, **kwargs_dict)
             else:
-                if schema.takes_context:
-                    result = await asyncio.to_thread(the_func, ctx, *args, **kwargs_dict)
-                else:
-                    result = await asyncio.to_thread(the_func, *args, **kwargs_dict)
+                result = await asyncio.to_thread(the_func, *args, **kwargs_dict)
+                if inspect.isawaitable(result):
+                    result = await result
 
             result = _validate_function_tool_output(
                 tool_name=tool_name,

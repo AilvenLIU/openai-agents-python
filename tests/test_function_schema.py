@@ -44,6 +44,51 @@ def test_no_args_function_with_context() -> None:
     assert result == "ok"
 
 
+def positional_only_context(ctx: RunContextWrapper[str], /, value: int) -> str:
+    return f"{ctx.context}:{value}"
+
+
+def positional_or_keyword_context(ctx: RunContextWrapper[str], value: int) -> str:
+    return f"{ctx.context}:{value}"
+
+
+def keyword_only_context(*, ctx: RunContextWrapper[str], value: int) -> str:
+    return f"{ctx.context}:{value}"
+
+
+def variadic_keyword_context(**ctx: RunContextWrapper[str]) -> str:
+    return str(ctx)
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        positional_only_context,
+        positional_or_keyword_context,
+        keyword_only_context,
+    ],
+)
+def test_context_placement_follows_parameter_kind(handler: Any) -> None:
+    func_schema = function_schema(handler)
+    context = RunContextWrapper(context="test")
+    parsed = func_schema.params_pydantic_model(value=4)
+
+    args, kwargs = func_schema.to_call_args(parsed, context=context)
+
+    assert handler(*args, **kwargs) == "test:4"
+    if handler is keyword_only_context:
+        assert args == []
+        assert kwargs["ctx"] is context
+    else:
+        assert args[0] is context
+        assert "ctx" not in kwargs
+
+
+def test_variadic_keyword_context_is_rejected() -> None:
+    with pytest.raises(UserError, match=r"\*\*kwargs"):
+        function_schema(variadic_keyword_context)
+
+
 def simple_function(a: int, b: int = 5):
     """
     Args:

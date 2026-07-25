@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+import functools
+from collections.abc import Callable
+from typing import Annotated, Any, get_args, get_origin
+
+
+def get_type_parameters(owner: Any) -> tuple[Any, ...]:
+    """Return type parameters declared by a legacy or PEP 695 generic type."""
+    parameters = getattr(owner, "__type_params__", ()) or getattr(owner, "__parameters__", ())
+    return parameters if isinstance(parameters, tuple) else ()
+
+
+def get_callable_call_descriptor(func: Callable[..., Any]) -> tuple[type[Any], Any]:
+    """Return the class that defines ``__call__`` and its raw descriptor."""
+    for owner in type(func).__mro__:
+        if "__call__" in owner.__dict__:
+            return owner, owner.__dict__["__call__"]
+    raise TypeError(f"{func!r} has no __call__ descriptor")
+
+
+def unwrap_callable_descriptor(descriptor: Any) -> Any:
+    """Return the callable behind method and partialmethod descriptors."""
+    while isinstance(descriptor, classmethod | staticmethod):
+        descriptor = descriptor.__func__
+    if isinstance(descriptor, functools.partialmethod):
+        return unwrap_callable_descriptor(descriptor.func)
+    return descriptor
+
+
+def substitute_typevars(annotation: Any, substitutions: dict[Any, Any]) -> Any:
+    """Apply type-variable substitutions within a generic annotation."""
+    try:
+        substituted = substitutions.get(annotation, annotation)
+    except TypeError:
+        substituted = annotation
+    if substituted is not annotation:
+        return substituted
+
+    if get_origin(annotation) is Annotated:
+        annotated_type, *metadata = get_args(annotation)
+        resolved_type = substitute_typevars(annotated_type, substitutions)
+        if resolved_type is annotated_type:
+            return annotation
+        return Annotated[(resolved_type, *metadata)]
+
+    args = get_args(annotation)
+    if not args:
+        return annotation
+    resolved_args = tuple(substitute_typevars(arg, substitutions) for arg in args)
+    if resolved_args == args:
+        return annotation
+
+    copy_with = getattr(annotation, "copy_with", None)
+    if callable(copy_with):
+        return copy_with(resolved_args)
+
+    origin = get_origin(annotation)
+    if origin is None:
+        return annotation
+    try:
+        return origin[resolved_args[0] if len(resolved_args) == 1 else resolved_args]
+    except TypeError:
+        return annotation
+
+
+def resolve_typevar_substitutions(
+    specialization: Any,
+    target_owner: type[Any],
+) -> dict[Any, Any]:
+    """Resolve a specialized generic instance's type variables for an inherited owner."""
+    specialization_origin = get_origin(specialization) or specialization
+    if not isinstance(specialization_origin, type):
+        return {}
+
+    initial_substitutions = dict(
+        zip(
+            get_type_parameters(specialization_origin),
+            get_args(specialization),
+            strict=False,
+        )
+    )
+
+    def resolve_owner(
+        owner: type[Any],
+        substitutions: dict[Any, Any],
+        seen: set[type[Any]],
+    ) -> dict[Any, Any]:
+        if owner is target_owner:
+            return substitutions
+        if owner in seen:
+            return {}
+
+        next_seen = {*seen, owner}
+        for base in getattr(owner, "__orig_bases__", ()):
+            base_origin = get_origin(base) or base
+            if not isinstance(base_origin, type):
+                continue
+            base_args = tuple(substitute_typevars(arg, substitutions) for arg in get_args(base))
+            base_substitutions = dict(
+                zip(get_type_parameters(base_origin), base_args, strict=False)
+            )
+            resolved = resolve_owner(base_origin, base_substitutions, next_seen)
+            if resolved:
+                return resolved
+        return {}
+
+    return resolve_owner(specialization_origin, initial_substitutions, set())

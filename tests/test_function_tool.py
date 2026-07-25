@@ -845,6 +845,66 @@ async def test_function_tool_bad_json_includes_payload_when_tool_logging_enabled
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("redacted", [True, False])
+async def test_function_tool_argument_logging_excludes_live_context(
+    redacted: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    context_secret = "CONTEXT_SECRET_SENTINEL"
+    model_argument = "MODEL_ARGUMENT_SENTINEL"
+
+    class SensitiveContext:
+        def __repr__(self) -> str:
+            return context_secret
+
+    def echo(ctx: ToolContext[Any], value: str) -> str:
+        assert isinstance(ctx.context, SensitiveContext)
+        return value
+
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", redacted)
+    tool = function_tool(echo)
+    live_context = ToolContext(
+        SensitiveContext(),
+        tool_name=tool.name,
+        tool_call_id="sensitive-context",
+        tool_arguments=json.dumps({"value": model_argument}),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="openai.agents"):
+        assert (
+            await tool.on_invoke_tool(
+                live_context,
+                json.dumps({"value": model_argument}),
+            )
+            == model_argument
+        )
+
+    argument_records = [
+        record for record in caplog.records if record.msg == "Tool call args: %s, kwargs: %s"
+    ]
+    if redacted:
+        assert argument_records == []
+        assert context_secret not in caplog.text
+        assert all(context_secret not in repr(record.__dict__) for record in caplog.records)
+    else:
+        assert len(argument_records) == 1
+        record = argument_records[0]
+        formatted = logging.Formatter().format(record)
+        assert model_argument in formatted
+        assert context_secret not in formatted
+        assert context_secret not in repr(record.__dict__)
+        assert record.exc_info is None
+        assert record.exc_text is None
+        assert isinstance(record.args, tuple)
+        logged_args, logged_kwargs = record.args
+        assert isinstance(logged_args, list)
+        assert isinstance(logged_kwargs, dict)
+        assert live_context not in logged_args
+        assert live_context not in logged_kwargs.values()
+
+
+@pytest.mark.asyncio
 async def test_default_failure_error_function_survives_deepcopy() -> None:
     def boom() -> None:
         raise RuntimeError("kapow")
