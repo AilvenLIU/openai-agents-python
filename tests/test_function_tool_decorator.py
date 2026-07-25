@@ -1361,7 +1361,7 @@ def test_nested_partialmethod_cannot_positionally_bind_context() -> None:
             return f"{ctx.context.data}:{value}"
 
         __call__: Any = functools.singledispatchmethod(
-            functools.partialmethod(handle, captured_context)
+            cast(Any, functools.partialmethod(handle, captured_context))
         )
 
     with pytest.raises(UserError, match="positionally bind"):
