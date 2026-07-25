@@ -9,6 +9,14 @@ import sys
 import typing
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import (
+    BuiltinFunctionType,
+    FunctionType,
+    MethodDescriptorType,
+    MethodType,
+    MethodWrapperType,
+    WrapperDescriptorType,
+)
 from typing import Annotated, Any, Literal, cast, get_args, get_origin, get_type_hints
 
 # griffelib exposes the `griffe` package at runtime but currently does not ship typing markers.
@@ -33,6 +41,14 @@ _CONTEXT_NOT_PROVIDED = object()
 _IMPLICIT_POSITIONAL_ARG = object()
 _PARTIAL_PLACEHOLDER = getattr(functools, "Placeholder", object())
 _NATIVE_SELF = getattr(typing, "Self", Self)
+_SUPPORTED_CALL_METHOD_TYPES = (
+    FunctionType,
+    MethodType,
+    BuiltinFunctionType,
+    MethodDescriptorType,
+    WrapperDescriptorType,
+    MethodWrapperType,
+)
 
 
 @dataclass
@@ -122,6 +138,66 @@ class FuncDocumentation:
 
 
 DocstringStyle = Literal["google", "numpy", "sphinx"]
+CallableContractSource = Literal[
+    "routine",
+    "class",
+    "partial",
+    "explicit_signature",
+    "wrapped",
+    "call_descriptor",
+]
+CallableAnnotationSource = Literal[
+    "signature",
+    "published",
+    "routine",
+    "wrapped",
+    "partial",
+    "call_descriptor",
+]
+CallableInvocationMode = Literal["async", "threaded"]
+
+
+@dataclass(frozen=True)
+class _CallableDescriptorPlan:
+    """Normalized binding and dispatch behavior for a raw ``__call__`` descriptor."""
+
+    call_method: Any
+    binds_receiver: bool
+    partial_args: tuple[Any, ...]
+    partial_keywords: dict[str, Any]
+    dispatches_dynamically: bool
+
+
+@dataclass(frozen=True)
+class ResolvedCallableContract:
+    """Normalized metadata for one supported Python callable."""
+
+    func: Callable[..., Any]
+    name: str
+    doc: str | None
+    signature: inspect.Signature
+    type_hints: dict[str, Any]
+    invocation_mode: CallableInvocationMode
+    source: CallableContractSource
+    annotation_source: CallableAnnotationSource
+    annotation_owner: Any | None
+    call_owner: type[Any] | None
+    call_descriptor: Any | None
+    call_method: Any | None
+    descriptor_plan: _CallableDescriptorPlan | None
+    partial_target: ResolvedCallableContract | None = None
+
+    @property
+    def is_async(self) -> bool:
+        """Return whether invocation can await the callable directly."""
+        return self.invocation_mode == "async"
+
+
+@dataclass(frozen=True)
+class _ResolvedCallableAnnotations:
+    type_hints: dict[str, Any]
+    source: CallableAnnotationSource
+    owner: Any | None
 
 
 def _is_context_annotation(annotation: Any) -> bool:
@@ -186,7 +262,10 @@ def _validate_no_positionally_bound_context(
             )
 
 
-def _get_callable_name(func: Callable[..., Any]) -> str:
+def _get_callable_name(
+    func: Callable[..., Any],
+    partial_target: ResolvedCallableContract | None = None,
+) -> str:
     """Return a stable name for functions and callable objects."""
     name = getattr(func, "__name__", None)
     if isinstance(name, str):
@@ -195,11 +274,18 @@ def _get_callable_name(func: Callable[..., Any]) -> str:
         unwrapped = inspect.unwrap(func)
         if unwrapped is not func:
             return _get_callable_name(unwrapped)
+        if partial_target is not None:
+            return partial_target.name
         return _get_callable_name(func.func)
     return type(func).__name__
 
 
-def _get_callable_doc(func: Callable[..., Any]) -> str | None:
+def _get_callable_doc(
+    func: Callable[..., Any],
+    *,
+    partial_target: ResolvedCallableContract | None = None,
+    call_method: Any | None = None,
+) -> str | None:
     """Return documentation from a callable or its invocation method."""
     if isinstance(func, functools.partial):
         published_doc = vars(func).get("__doc__", _CONTEXT_NOT_PROVIDED)
@@ -208,15 +294,59 @@ def _get_callable_doc(func: Callable[..., Any]) -> str | None:
         unwrapped = inspect.unwrap(func)
         if unwrapped is not func:
             return _get_callable_doc(unwrapped)
+        if partial_target is not None:
+            return partial_target.doc
         return _get_callable_doc(func.func)
     doc = inspect.getdoc(func)
     if doc is not None or inspect.isroutine(func) or inspect.isclass(func):
         return doc
-    _, call_descriptor = get_callable_call_descriptor(func)
-    return inspect.getdoc(unwrap_callable_descriptor(call_descriptor))
+    if call_method is None:
+        _, call_descriptor = get_callable_call_descriptor(func)
+        call_method = unwrap_callable_descriptor(call_descriptor)
+    return inspect.getdoc(call_method)
 
 
-def _get_callable_signature(func: Callable[..., Any]) -> inspect.Signature:
+def _resolve_callable_descriptor_plan(descriptor: Any) -> _CallableDescriptorPlan:
+    """Normalize supported descriptor wrappers into one invocation binding plan."""
+    partial_args: list[Any] = []
+    partial_keywords: dict[str, Any] = {}
+    dispatches_dynamically = False
+    binds_receiver = True
+
+    while True:
+        if isinstance(descriptor, functools.partialmethod):
+            partial_args.extend(descriptor.args)
+            partial_keywords.update(descriptor.keywords or {})
+            descriptor = descriptor.func
+        elif isinstance(descriptor, functools.singledispatchmethod):
+            dispatches_dynamically = True
+            descriptor = descriptor.func
+        elif isinstance(descriptor, staticmethod):
+            binds_receiver = False
+            descriptor = descriptor.__func__
+        elif isinstance(descriptor, classmethod):
+            binds_receiver = True
+            descriptor = descriptor.__func__
+        else:
+            break
+
+    return _CallableDescriptorPlan(
+        call_method=descriptor,
+        binds_receiver=binds_receiver,
+        partial_args=tuple(partial_args),
+        partial_keywords=partial_keywords,
+        dispatches_dynamically=dispatches_dynamically,
+    )
+
+
+def _get_callable_signature(
+    func: Callable[..., Any],
+    *,
+    call_owner: type[Any] | None = None,
+    call_descriptor: Any | None = None,
+    call_method: Any | None = None,
+    descriptor_plan: _CallableDescriptorPlan | None = None,
+) -> inspect.Signature:
     """Return the effective invocation signature without double-binding descriptors."""
     if inspect.isroutine(func) or inspect.isclass(func) or isinstance(func, functools.partial):
         return inspect.signature(func)
@@ -226,10 +356,23 @@ def _get_callable_signature(func: Callable[..., Any]) -> inspect.Signature:
     ):
         return inspect.signature(func)
 
-    call_owner, call_descriptor = get_callable_call_descriptor(func)
-    call_method = unwrap_callable_descriptor(call_descriptor)
-    if isinstance(call_descriptor, functools.singledispatchmethod):
-        return inspect.signature(functools.partial(call_method, object()))
+    if call_owner is None or call_descriptor is None or call_method is None:
+        call_owner, call_descriptor = get_callable_call_descriptor(func)
+        call_method = unwrap_callable_descriptor(call_descriptor)
+    if descriptor_plan is None:
+        descriptor_plan = _resolve_callable_descriptor_plan(call_descriptor)
+    if descriptor_plan.dispatches_dynamically:
+        dynamic_bound_args: list[Any] = [object()] if descriptor_plan.binds_receiver else []
+        dynamic_bound_args.extend(descriptor_plan.partial_args)
+        if dynamic_bound_args or descriptor_plan.partial_keywords:
+            return inspect.signature(
+                functools.partial(
+                    descriptor_plan.call_method,
+                    *dynamic_bound_args,
+                    **descriptor_plan.partial_keywords,
+                )
+            )
+        return inspect.signature(descriptor_plan.call_method)
     if hasattr(call_method, "__wrapped__"):
         resolved_signature = inspect.signature(call_method)
         resolved_params = list(resolved_signature.parameters.values())
@@ -299,17 +442,15 @@ def _get_signature_type_hints(
         pass
 
     annotation_source.__annotations__ = annotations
-    globalns, localns = _get_callable_annotation_namespaces(
-        func,
-        local_owner=_get_callable_protocol_owner(func, "__signature__"),
-    )
+    signature_owner = _get_callable_protocol_owner(func, "__signature__")
+    globalns, localns = _get_callable_annotation_namespaces(func, local_owner=signature_owner)
     resolved_hints = get_type_hints(
         annotation_source,
         globalns=globalns,
         localns=localns,
         include_extras=True,
     )
-    owner = func if inspect.isclass(func) else type(func)
+    owner = signature_owner or (func if inspect.isclass(func) else type(func))
     return _apply_callable_type_specialization(resolved_hints, func, owner)
 
 
@@ -371,24 +512,33 @@ def _apply_callable_type_specialization(
 
 
 def _get_callable_type_hints(
-    func: Callable[..., Any], signature: inspect.Signature
-) -> dict[str, Any]:
+    func: Callable[..., Any],
+    signature: inspect.Signature,
+    *,
+    partial_target: ResolvedCallableContract | None = None,
+    call_owner: type[Any] | None = None,
+    call_descriptor: Any | None = None,
+    call_method: Any | None = None,
+    descriptor_plan: _CallableDescriptorPlan | None = None,
+) -> _ResolvedCallableAnnotations:
     """Resolve callable hints using signature, published, wrapped, then structural metadata."""
-    partial_signature: inspect.Signature | None = None
-    partial_type_hints: dict[str, Any] | None = None
     if isinstance(func, functools.partial):
-        partial_signature = _get_callable_signature(func.func)
-        partial_type_hints = _get_callable_type_hints(func.func, partial_signature)
+        if partial_target is None:
+            partial_target = resolve_callable_contract(func.func)
         _validate_no_positionally_bound_context(
-            partial_signature,
-            partial_type_hints,
+            partial_target.signature,
+            partial_target.type_hints,
             positional_args=func.args,
             implicit_positional_count=0,
             partial_kind="functools.partial",
         )
 
     if isinstance(getattr(func, "__signature__", None), inspect.Signature):
-        return _get_signature_type_hints(func, signature)
+        return _ResolvedCallableAnnotations(
+            type_hints=_get_signature_type_hints(func, signature),
+            source="signature",
+            owner=_get_callable_protocol_owner(func, "__signature__"),
+        )
 
     try:
         instance_vars = vars(func)
@@ -420,28 +570,53 @@ def _get_callable_type_hints(
                 locals=localns,
                 eval_str=True,
             )
-        return _apply_callable_type_specialization(published_hints, func, type(func))
+        return _ResolvedCallableAnnotations(
+            type_hints=_apply_callable_type_specialization(published_hints, func, type(func)),
+            source="published",
+            owner=type(func),
+        )
 
     if isinstance(func, functools.partial):
         unwrapped = inspect.unwrap(func)
         if unwrapped is not func:
-            return _get_callable_type_hints(unwrapped, signature)
-        assert partial_type_hints is not None
-        return {
-            name: annotation
-            for name, annotation in partial_type_hints.items()
-            if name == "return" or name in signature.parameters
-        }
+            wrapped_contract = resolve_callable_contract(unwrapped)
+            return _ResolvedCallableAnnotations(
+                type_hints=wrapped_contract.type_hints,
+                source="wrapped",
+                owner=wrapped_contract.annotation_owner,
+            )
+        assert partial_target is not None
+        return _ResolvedCallableAnnotations(
+            type_hints={
+                name: annotation
+                for name, annotation in partial_target.type_hints.items()
+                if name == "return" or name in signature.parameters
+            },
+            source="partial",
+            owner=partial_target.annotation_owner,
+        )
 
     if inspect.isroutine(func) or inspect.isclass(func):
-        return get_type_hints(func, include_extras=True)
+        return _ResolvedCallableAnnotations(
+            type_hints=get_type_hints(func, include_extras=True),
+            source="routine",
+            owner=func if inspect.isclass(func) else None,
+        )
 
     unwrapped = inspect.unwrap(func)
     if unwrapped is not func:
-        return _get_callable_type_hints(unwrapped, signature)
+        wrapped_contract = resolve_callable_contract(unwrapped)
+        return _ResolvedCallableAnnotations(
+            type_hints=wrapped_contract.type_hints,
+            source="wrapped",
+            owner=wrapped_contract.annotation_owner,
+        )
 
-    call_owner, call_descriptor = get_callable_call_descriptor(func)
-    call_method = unwrap_callable_descriptor(call_descriptor)
+    if call_owner is None or call_descriptor is None or call_method is None:
+        call_owner, call_descriptor = get_callable_call_descriptor(func)
+        call_method = unwrap_callable_descriptor(call_descriptor)
+    if descriptor_plan is None:
+        descriptor_plan = _resolve_callable_descriptor_plan(call_descriptor)
     globalns, localns = _get_callable_annotation_namespaces(func)
     call_globalns = getattr(call_method, "__globals__", None)
     if call_globalns is not None:
@@ -467,7 +642,7 @@ def _get_callable_type_hints(
         call_owner,
     )
     if isinstance(call_descriptor, functools.partialmethod):
-        implicit_positional_count = 0 if isinstance(call_descriptor.func, staticmethod) else 1
+        implicit_positional_count = 1 if descriptor_plan.binds_receiver else 0
         _validate_no_positionally_bound_context(
             inspect.signature(call_method),
             call_type_hints,
@@ -475,12 +650,125 @@ def _get_callable_type_hints(
             implicit_positional_count=implicit_positional_count,
             partial_kind="functools.partialmethod",
         )
-        return {
+        call_type_hints = {
             name: annotation
             for name, annotation in call_type_hints.items()
             if name == "return" or name in signature.parameters
         }
-    return call_type_hints
+    return _ResolvedCallableAnnotations(
+        type_hints=call_type_hints,
+        source="call_descriptor",
+        owner=call_owner,
+    )
+
+
+def _resolve_structural_call_descriptor(
+    func: Callable[..., Any],
+) -> tuple[
+    type[Any] | None,
+    Any | None,
+    Any | None,
+    _CallableDescriptorPlan | None,
+]:
+    """Resolve and validate the raw invocation descriptor for a callable object."""
+    if inspect.isroutine(func) or inspect.isclass(func) or isinstance(func, functools.partial):
+        return None, None, None, None
+
+    call_owner, call_descriptor = get_callable_call_descriptor(func)
+    descriptor_plan = _resolve_callable_descriptor_plan(call_descriptor)
+    call_method = descriptor_plan.call_method
+    if not isinstance(call_method, _SUPPORTED_CALL_METHOD_TYPES):
+        raise UserError(
+            "Unsupported callable object: __call__ must be a function, method, builtin, "
+            "staticmethod, classmethod, functools.partialmethod, or "
+            "functools.singledispatchmethod. Publish an explicit wrapper function instead of "
+            f"the {type(call_descriptor).__name__} descriptor."
+        )
+    return call_owner, call_descriptor, call_method, descriptor_plan
+
+
+def _get_callable_contract_source(
+    func: Callable[..., Any],
+) -> CallableContractSource:
+    """Classify the public contract source selected for a callable."""
+    if isinstance(getattr(func, "__signature__", None), inspect.Signature):
+        return "explicit_signature"
+    if isinstance(func, functools.partial):
+        return "partial"
+    if inspect.isclass(func):
+        return "class"
+    if inspect.isroutine(func):
+        return "routine"
+    if hasattr(func, "__wrapped__"):
+        return "wrapped"
+    return "call_descriptor"
+
+
+def resolve_callable_contract(func: Callable[..., Any]) -> ResolvedCallableContract:
+    """Resolve one normalized contract used by schema generation and invocation."""
+    partial_target = (
+        resolve_callable_contract(func.func) if isinstance(func, functools.partial) else None
+    )
+    call_owner, call_descriptor, call_method, descriptor_plan = _resolve_structural_call_descriptor(
+        func
+    )
+    signature = _get_callable_signature(
+        func,
+        call_owner=call_owner,
+        call_descriptor=call_descriptor,
+        call_method=call_method,
+        descriptor_plan=descriptor_plan,
+    )
+    annotations = _get_callable_type_hints(
+        func,
+        signature,
+        partial_target=partial_target,
+        call_owner=call_owner,
+        call_descriptor=call_descriptor,
+        call_method=call_method,
+        descriptor_plan=descriptor_plan,
+    )
+    if partial_target is not None:
+        invocation_mode = partial_target.invocation_mode
+        resolved_call_owner = partial_target.call_owner
+        resolved_call_descriptor = partial_target.call_descriptor
+        resolved_call_method = partial_target.call_method
+        resolved_descriptor_plan = partial_target.descriptor_plan
+    else:
+        is_direct_async = inspect.iscoroutinefunction(func) or (
+            call_method is not None and inspect.iscoroutinefunction(call_method)
+        )
+        invocation_mode = (
+            "async"
+            if is_direct_async
+            and not (descriptor_plan is not None and descriptor_plan.dispatches_dynamically)
+            else "threaded"
+        )
+        resolved_call_owner = call_owner
+        resolved_call_descriptor = call_descriptor
+        resolved_call_method = call_method
+        resolved_descriptor_plan = descriptor_plan
+
+    return ResolvedCallableContract(
+        func=func,
+        name=_get_callable_name(func, partial_target),
+        doc=_get_callable_doc(
+            func,
+            partial_target=partial_target,
+            call_method=call_method,
+        ),
+        signature=signature,
+        type_hints=annotations.type_hints,
+        invocation_mode=invocation_mode,
+        source=_get_callable_contract_source(func),
+        annotation_source=annotations.source,
+        annotation_owner=annotations.owner,
+        call_owner=resolved_call_owner,
+        call_descriptor=resolved_call_descriptor,
+        call_method=resolved_call_method,
+        descriptor_plan=resolved_descriptor_plan,
+        partial_target=partial_target,
+    )
 
 
 # As of Feb 2025, the automatic style detection in griffe is an Insiders feature. This
@@ -604,8 +892,28 @@ def generate_func_documentation(
         A FuncDocumentation object containing the function's name, description, and parameter
         descriptions.
     """
-    name = _get_callable_name(func)
-    doc = _get_callable_doc(func)
+    return _parse_func_documentation(
+        name=_get_callable_name(func),
+        doc=_get_callable_doc(func),
+        style=style,
+    )
+
+
+def _generate_func_documentation(
+    contract: ResolvedCallableContract,
+    style: DocstringStyle | None = None,
+) -> FuncDocumentation:
+    """Extract model-facing documentation from a resolved callable contract."""
+    return _parse_func_documentation(name=contract.name, doc=contract.doc, style=style)
+
+
+def _parse_func_documentation(
+    *,
+    name: str,
+    doc: str | None,
+    style: DocstringStyle | None,
+) -> FuncDocumentation:
+    """Parse model-facing documentation from normalized callable metadata."""
     if not doc:
         return FuncDocumentation(name=name, description=None, param_descriptions=None)
 
@@ -700,17 +1008,36 @@ def function_schema(
         A `FuncSchema` object containing the function's name, description, parameter descriptions,
         and other metadata.
     """
+    return _function_schema_from_contract(
+        resolve_callable_contract(func),
+        docstring_style=docstring_style,
+        name_override=name_override,
+        description_override=description_override,
+        use_docstring_info=use_docstring_info,
+        strict_json_schema=strict_json_schema,
+    )
+
+
+def _function_schema_from_contract(
+    contract: ResolvedCallableContract,
+    docstring_style: DocstringStyle | None = None,
+    name_override: str | None = None,
+    description_override: str | None = None,
+    use_docstring_info: bool = True,
+    strict_json_schema: bool = True,
+) -> FuncSchema:
+    """Build a function schema from a previously resolved callable contract."""
 
     # 1. Grab docstring info
     if use_docstring_info:
-        doc_info = generate_func_documentation(func, docstring_style)
+        doc_info = _generate_func_documentation(contract, docstring_style)
         param_descs = dict(doc_info.param_descriptions or {})
     else:
         doc_info = None
         param_descs = {}
 
-    sig = _get_callable_signature(func)
-    type_hints_with_extras = _get_callable_type_hints(func, sig)
+    sig = contract.signature
+    type_hints_with_extras = contract.type_hints
     type_hints: dict[str, Any] = {}
     annotated_param_descs: dict[str, str] = {}
     param_metadata: dict[str, tuple[Any, ...]] = {}
@@ -731,7 +1058,7 @@ def function_schema(
         param_descs.setdefault(name, description)
 
     # Ensure name_override takes precedence even if docstring info is disabled.
-    func_name = name_override or (doc_info.name if doc_info else _get_callable_name(func))
+    func_name = name_override or (doc_info.name if doc_info else contract.name)
 
     # 2. Inspect function signature and get type hints
     params = list(sig.parameters.items())

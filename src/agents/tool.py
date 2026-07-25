@@ -4,7 +4,6 @@ import ast
 import asyncio
 import copy
 import dataclasses
-import functools
 import inspect
 import json
 import math
@@ -46,10 +45,8 @@ from typing_extensions import NotRequired, ParamSpec, TypeAliasType, TypedDict
 
 from . import _debug
 from ._callable_utils import (
-    get_callable_call_descriptor,
     get_type_parameters,
     substitute_typevars,
-    unwrap_callable_descriptor,
 )
 from ._config_coercion import coerce_pydantic_config
 from ._tool_identity import (
@@ -61,7 +58,11 @@ from ._tool_identity import (
 from .computer import AsyncComputer, Computer
 from .editor import ApplyPatchEditor, ApplyPatchOperation
 from .exceptions import ModelBehaviorError, ToolTimeoutError, UserError
-from .function_schema import DocstringStyle, function_schema
+from .function_schema import (
+    DocstringStyle,
+    _function_schema_from_contract,
+    resolve_callable_contract,
+)
 from .logger import log_tool_action_warning, logger
 from .run_context import RunContextWrapper
 from .strict_schema import ensure_strict_json_schema
@@ -2252,16 +2253,6 @@ def _unwrap_awaitable_return_type(annotation: Any) -> Any:
     return annotation
 
 
-def _is_async_function_tool_callable(func: Callable[..., Any]) -> bool:
-    """Return whether a callable should use the async function-tool invocation path."""
-    if isinstance(func, functools.partial):
-        return _is_async_function_tool_callable(func.func)
-    if inspect.iscoroutinefunction(func):
-        return True
-    _, call_descriptor = get_callable_call_descriptor(func)
-    return inspect.iscoroutinefunction(unwrap_callable_descriptor(call_descriptor))
-
-
 def _resolve_function_tool_output(
     *,
     return_annotation: Any,
@@ -2458,9 +2449,10 @@ def function_tool(
     """
 
     def _create_function_tool(the_func: ToolFunction[...]) -> FunctionTool:
-        is_sync_function_tool = not _is_async_function_tool_callable(the_func)
-        schema = function_schema(
-            func=the_func,
+        callable_contract = resolve_callable_contract(the_func)
+        is_sync_function_tool = not callable_contract.is_async
+        schema = _function_schema_from_contract(
+            callable_contract,
             name_override=name_override,
             description_override=description_override,
             docstring_style=docstring_style,

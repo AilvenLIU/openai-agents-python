@@ -5,6 +5,7 @@ import functools
 import inspect
 import json
 import sys
+import threading
 from collections.abc import Callable
 from types import ModuleType
 from typing import Annotated, Any, Generic, TypeVar, cast
@@ -14,7 +15,9 @@ from inline_snapshot import snapshot
 from pydantic import BaseModel, Field
 from typing_extensions import Self
 
+import agents.tool as tool_module
 from agents import UserError, function_tool
+from agents.function_schema import resolve_callable_contract
 from agents.run_context import RunContextWrapper
 from agents.tool_context import ToolContext
 
@@ -385,6 +388,124 @@ async def test_sync_callable_object_awaits_awaitable_result_once() -> None:
     assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == 12
     assert handler.calls == 1
     assert handler.awaits == 1
+
+
+def test_callable_contract_conformance_matrix() -> None:
+    async def async_handler(prefix: str, value: int) -> int:
+        return len(prefix) + value
+
+    class AsyncCallable:
+        async def __call__(self, value: int) -> int:
+            return value
+
+    class ExplicitSignatureCallable:
+        __signature__ = inspect.Signature(
+            [
+                inspect.Parameter(
+                    "value",
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    annotation=int,
+                )
+            ],
+            return_annotation=int,
+        )
+
+        async def __call__(self, *args: Any, **kwargs: Any) -> int:
+            return cast(int, args[0])
+
+    class PartialMethodCallable:
+        async def handle(self, prefix: str, value: int) -> int:
+            return len(prefix) + value
+
+        __call__ = functools.partialmethod(handle, "bound")
+
+    class SingleDispatchCallable:
+        @functools.singledispatchmethod
+        async def __call__(self, value: int) -> int:
+            return value
+
+    wrapped_handler = CallableWrapper(async_handler)
+    cases = [
+        (async_handler, "routine", "routine", True, ["prefix", "value"]),
+        (
+            functools.partial(async_handler, "bound"),
+            "partial",
+            "partial",
+            True,
+            ["value"],
+        ),
+        (
+            AsyncCallable(),
+            "call_descriptor",
+            "call_descriptor",
+            True,
+            ["value"],
+        ),
+        (
+            ExplicitSignatureCallable(),
+            "explicit_signature",
+            "signature",
+            True,
+            ["value"],
+        ),
+        (wrapped_handler, "wrapped", "published", False, ["prefix", "value"]),
+        (
+            PartialMethodCallable(),
+            "call_descriptor",
+            "call_descriptor",
+            True,
+            ["value"],
+        ),
+        (
+            SingleDispatchCallable(),
+            "call_descriptor",
+            "call_descriptor",
+            False,
+            ["value"],
+        ),
+    ]
+
+    for handler, source, annotation_source, is_async, parameters in cases:
+        contract = resolve_callable_contract(cast(Callable[..., Any], handler))
+
+        assert contract.source == source
+        assert contract.annotation_source == annotation_source
+        assert contract.is_async is is_async
+        assert list(contract.signature.parameters) == parameters
+        assert set(contract.type_hints) == {*parameters, "return"}
+
+
+def test_callable_contract_rejects_unknown_call_descriptor() -> None:
+    class CustomDescriptor:
+        def __get__(self, instance: Any, owner: type[Any]) -> Callable[..., Any]:
+            return lambda value: value
+
+    class Handler:
+        __call__ = CustomDescriptor()
+
+    with pytest.raises(UserError, match="Unsupported callable object"):
+        function_tool(Handler())
+
+
+def test_function_tool_resolves_callable_contract_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Handler:
+        async def __call__(self, value: int) -> int:
+            return value
+
+    handler = Handler()
+    resolved: list[Callable[..., Any]] = []
+
+    def counting_resolver(func: Callable[..., Any]) -> Any:
+        resolved.append(func)
+        return resolve_callable_contract(func)
+
+    monkeypatch.setattr(tool_module, "resolve_callable_contract", counting_resolver)
+
+    function_tool(handler)
+
+    assert resolved == [handler]
 
 
 @pytest.mark.asyncio
@@ -1138,6 +1259,98 @@ async def test_singledispatchmethod_callable_uses_underlying_contract() -> None:
     assert list(tool.params_json_schema["properties"]) == ["value"]
     assert tool.params_json_schema["properties"]["value"]["type"] == "integer"
     assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == 8
+
+
+@pytest.mark.asyncio
+async def test_inherited_generic_callable_specializes_custom_signature() -> None:
+    class BaseHandler(Generic[CallableValueT]):
+        __signature__ = inspect.Signature(
+            [
+                inspect.Parameter(
+                    "value",
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    annotation="CallableValueT",
+                )
+            ],
+            return_annotation="CallableValueT",
+        )
+
+        async def __call__(self, *args: Any, **kwargs: Any) -> CallableValueT:
+            return cast(CallableValueT, args[0])
+
+    class IntHandler(BaseHandler[int]):
+        pass
+
+    tool = function_tool(IntHandler())
+
+    assert tool.params_json_schema["properties"]["value"]["type"] == "integer"
+    assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == 4
+
+
+@pytest.mark.asyncio
+async def test_mixed_singledispatchmethod_uses_dynamic_invocation_path() -> None:
+    sync_thread_ids: list[int] = []
+
+    class Handler:
+        @functools.singledispatchmethod
+        async def __call__(self, value: int | str) -> str:
+            await asyncio.sleep(0)
+            return f"async:{value}"
+
+        def handle_str(self, value: str) -> str:
+            sync_thread_ids.append(threading.get_ident())
+            return f"sync:{value}"
+
+    cast(Any, Handler.__dict__["__call__"]).register(str, Handler.handle_str)
+    tool = function_tool(Handler())
+
+    assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == "async:4"
+    assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": "four"}') == "sync:four"
+    assert sync_thread_ids
+    assert sync_thread_ids[0] != threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_singledispatchmethod_descriptor_binding_matrix() -> None:
+    class StaticHandler:
+        @functools.singledispatchmethod
+        @staticmethod
+        async def __call__(value: int) -> int:
+            return value * 2
+
+    class ClassHandler:
+        @functools.singledispatchmethod
+        @classmethod
+        async def __call__(cls, value: int) -> int:
+            return value * 3
+
+    for handler, expected in ((StaticHandler(), 8), (ClassHandler(), 12)):
+        tool = function_tool(cast(Callable[..., Any], handler))
+        assert list(tool.params_json_schema["properties"]) == ["value"]
+        assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == expected
+
+
+@pytest.mark.asyncio
+async def test_partialmethod_applies_bindings_around_singledispatchmethod() -> None:
+    class Handler:
+        @functools.singledispatchmethod
+        async def handle(self, prefix: str, value: int) -> str:
+            return f"{prefix}:{value}"
+
+        __call__: Any = functools.partialmethod(handle, "bound")
+
+    class StaticHandler:
+        @functools.singledispatchmethod
+        @staticmethod
+        async def handle(prefix: str, value: int) -> str:
+            return f"{prefix}:{value}"
+
+        __call__: Any = functools.partialmethod(handle, "static")
+
+    for handler, expected in ((Handler(), "bound:4"), (StaticHandler(), "static:4")):
+        tool = function_tool(cast(Callable[..., Any], handler))
+        assert list(tool.params_json_schema["properties"]) == ["value"]
+        assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == expected
 
 
 @pytest.mark.asyncio
