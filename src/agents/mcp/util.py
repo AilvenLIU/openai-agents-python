@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import functools
-import hashlib
 import inspect
 import json
 from collections import Counter
@@ -17,6 +16,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from .. import _debug
 from .._mcp_tool_metadata import resolve_mcp_tool_description_for_model, resolve_mcp_tool_title
+from .._tool_identity import safe_tool_name_part, shorten_tool_name
 from ..exceptions import AgentsException, MCPToolCancellationError, ModelBehaviorError, UserError
 
 try:
@@ -56,10 +56,6 @@ if TYPE_CHECKING:
 
     from ..agent import AgentBase
     from .server import MCPServer
-
-
-_MCP_FUNCTION_TOOL_NAME_MAX_LENGTH = 64
-_MCP_FUNCTION_TOOL_HASH_LENGTH = 8
 
 
 @dataclass(frozen=True)
@@ -412,25 +408,11 @@ class MCPUtil:
 
     @staticmethod
     def _safe_tool_name_part(value: str, fallback: str) -> str:
-        safe = "".join(
-            char if char.isascii() and (char.isalnum() or char in {"_", "-"}) else "_"
-            for char in value
-        )
-        safe = safe.strip("_-")
-        return safe or fallback
+        return safe_tool_name_part(value, fallback)
 
     @staticmethod
     def _shorten_tool_name(base_name: str, seed: str, *, force_hash: bool = False) -> str:
-        if not force_hash and len(base_name) <= _MCP_FUNCTION_TOOL_NAME_MAX_LENGTH:
-            return base_name
-
-        hash_suffix = hashlib.sha1(seed.encode("utf-8")).hexdigest()[
-            :_MCP_FUNCTION_TOOL_HASH_LENGTH
-        ]
-        suffix = f"_{hash_suffix}"
-        stem_length = _MCP_FUNCTION_TOOL_NAME_MAX_LENGTH - len(suffix)
-        stem = base_name[:stem_length].rstrip("_-") or "mcp"
-        return f"{stem}{suffix}"
+        return shorten_tool_name(base_name, seed, force_hash=force_hash, fallback="mcp")
 
     @classmethod
     def _build_prefixed_tool_base_name(cls, server_name: str, tool_name: str) -> str:

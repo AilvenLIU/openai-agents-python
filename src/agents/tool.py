@@ -2461,7 +2461,7 @@ def function_tool(
                 logger.debug("Tool call args: %s, kwargs: %s", logged_args, logged_kwargs)
 
             args, kwargs_dict = schema.to_call_args(parsed, context=ctx)
-            if not is_sync_function_tool:
+            if callable_contract.is_async_at_invocation():
                 result = await the_func(*args, **kwargs_dict)
             else:
                 result = await asyncio.to_thread(the_func, *args, **kwargs_dict)

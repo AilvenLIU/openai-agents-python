@@ -33,6 +33,7 @@ from ._callable_utils import (
     substitute_typevars,
     unwrap_callable_descriptor,
 )
+from ._tool_identity import normalize_function_tool_name
 from .exceptions import UserError
 from .run_context import RunContextWrapper
 from .strict_schema import ensure_strict_json_schema
@@ -169,6 +170,7 @@ class _CallableDescriptorPlan:
     has_partialmethod: bool
     dispatches_dynamically: bool
     dispatches_async_only: bool
+    singledispatch_descriptors: tuple[Any, ...]
 
 
 @dataclass(frozen=True)
@@ -194,6 +196,16 @@ class ResolvedCallableContract:
     def is_async(self) -> bool:
         """Return whether invocation can await the callable directly."""
         return self.invocation_mode == "async"
+
+    def is_async_at_invocation(self) -> bool:
+        """Return whether the current dispatcher registry remains entirely async."""
+        if not self.is_async:
+            return False
+        if self.descriptor_plan is None or not self.descriptor_plan.dispatches_dynamically:
+            return True
+        return _singledispatch_descriptors_are_async_only(
+            self.descriptor_plan.singledispatch_descriptors
+        )
 
 
 @dataclass(frozen=True)
@@ -281,7 +293,7 @@ def _get_callable_name(
         if partial_target is not None:
             return partial_target.name
         return _get_callable_name(func.func)
-    return type(func).__name__
+    return normalize_function_tool_name(type(func).__name__, fallback="callable")
 
 
 def _get_callable_doc(
@@ -310,13 +322,22 @@ def _get_callable_doc(
     return inspect.getdoc(call_method)
 
 
+def _singledispatch_descriptors_are_async_only(descriptors: tuple[Any, ...]) -> bool:
+    """Return whether every current singledispatch registration is asynchronous."""
+    return all(
+        inspect.iscoroutinefunction(unwrap_callable_descriptor(implementation))
+        for descriptor in descriptors
+        for implementation in descriptor.dispatcher.registry.values()
+    )
+
+
 def _resolve_callable_descriptor_plan(descriptor: Any) -> _CallableDescriptorPlan:
     """Normalize supported descriptor wrappers into one invocation binding plan."""
     partial_args: list[Any] = []
     partial_keywords: dict[str, Any] = {}
     has_partialmethod = False
     dispatches_dynamically = False
-    dispatches_async_only = True
+    singledispatch_descriptors: list[Any] = []
     binds_receiver = True
 
     while True:
@@ -327,10 +348,7 @@ def _resolve_callable_descriptor_plan(descriptor: Any) -> _CallableDescriptorPla
             descriptor = descriptor.func
         elif isinstance(descriptor, functools.singledispatchmethod):
             dispatches_dynamically = True
-            dispatches_async_only = dispatches_async_only and all(
-                inspect.iscoroutinefunction(unwrap_callable_descriptor(implementation))
-                for implementation in descriptor.dispatcher.registry.values()
-            )
+            singledispatch_descriptors.append(descriptor)
             descriptor = descriptor.func
         elif isinstance(descriptor, staticmethod):
             binds_receiver = False
@@ -348,7 +366,10 @@ def _resolve_callable_descriptor_plan(descriptor: Any) -> _CallableDescriptorPla
         partial_keywords=partial_keywords,
         has_partialmethod=has_partialmethod,
         dispatches_dynamically=dispatches_dynamically,
-        dispatches_async_only=dispatches_async_only,
+        dispatches_async_only=_singledispatch_descriptors_are_async_only(
+            tuple(singledispatch_descriptors)
+        ),
+        singledispatch_descriptors=tuple(singledispatch_descriptors),
     )
 
 

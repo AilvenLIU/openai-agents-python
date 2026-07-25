@@ -35,7 +35,7 @@ from openai.types.responses.response_output_item import (
     ProgramOutput,
 )
 from pydantic import BaseModel, ConfigDict, Field
-from typing_extensions import TypedDict
+from typing_extensions import TypeAliasType, TypedDict, TypeVar as TypeVarWithDefault
 
 from agents import (
     Agent,
@@ -477,6 +477,92 @@ async def test_function_tool_resolves_pep695_awaitable_aliases() -> None:
                 "maybe_handler": 7,
             }[handler_name],
         )
+
+
+@pytest.mark.asyncio
+async def test_function_tool_resolves_defaulted_awaitable_aliases() -> None:
+    output_type = TypeVarWithDefault("output_type", default=InventoryOutput)
+    prefix_type = TypeVarWithDefault("prefix_type")
+    DefaultOutputAwaitable = TypeAliasType(
+        "DefaultOutputAwaitable",
+        Awaitable[output_type],
+        type_params=(output_type,),
+    )
+    PartiallyDefaultedAwaitable = TypeAliasType(
+        "PartiallyDefaultedAwaitable",
+        Awaitable[output_type],
+        type_params=(prefix_type, output_type),
+    )
+
+    def bare_handler() -> Any:
+        return InventoryAwaitable(InventoryOutput(sku="default", available_units=8))
+
+    def partial_handler() -> Any:
+        return InventoryAwaitable(InventoryOutput(sku="partial-default", available_units=9))
+
+    bare_handler.__annotations__["return"] = DefaultOutputAwaitable
+    partial_handler.__annotations__["return"] = PartiallyDefaultedAwaitable[str]
+
+    for handler, expected in (
+        (bare_handler, InventoryOutput(sku="default", available_units=8)),
+        (
+            partial_handler,
+            InventoryOutput(sku="partial-default", available_units=9),
+        ),
+    ):
+        tool = function_tool(handler, allowed_callers=["programmatic"])
+        assert tool.output_json_schema is not None
+        assert tool.output_json_schema["title"] == "InventoryOutput"
+        context = ToolContext(
+            None,
+            tool_name=tool.name,
+            tool_call_id=f"{tool.name}-defaulted-alias-output",
+            tool_arguments="{}",
+            tool_call=_function_call(),
+        )
+        assert await tool.on_invoke_tool(context, "{}") == expected
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 13),
+    reason="Native type parameter defaults require Python 3.13",
+)
+@pytest.mark.asyncio
+async def test_function_tool_resolves_native_defaulted_awaitable_aliases() -> None:
+    namespace = {
+        "Awaitable": Awaitable,
+        "InventoryAwaitable": InventoryAwaitable,
+        "InventoryOutput": InventoryOutput,
+    }
+    exec(
+        "type DefaultOutputAwaitable[T = InventoryOutput] = Awaitable[T]\n"
+        "type PartiallyDefaultedAwaitable[Prefix, T = InventoryOutput] = Awaitable[T]\n"
+        "def bare_handler() -> DefaultOutputAwaitable:\n"
+        "    return InventoryAwaitable(\n"
+        "        InventoryOutput(sku='native-default', available_units=10)\n"
+        "    )\n"
+        "def partial_handler() -> PartiallyDefaultedAwaitable[str]:\n"
+        "    return InventoryAwaitable(\n"
+        "        InventoryOutput(sku='native-partial', available_units=11)\n"
+        "    )\n",
+        namespace,
+    )
+
+    for handler_name, expected in (
+        ("bare_handler", InventoryOutput(sku="native-default", available_units=10)),
+        ("partial_handler", InventoryOutput(sku="native-partial", available_units=11)),
+    ):
+        tool = function_tool(namespace[handler_name], allowed_callers=["programmatic"])
+        assert tool.output_json_schema is not None
+        assert tool.output_json_schema["title"] == "InventoryOutput"
+        context = ToolContext(
+            None,
+            tool_name=tool.name,
+            tool_call_id=f"{handler_name}-native-defaulted-alias-output",
+            tool_arguments="{}",
+            tool_call=_function_call(),
+        )
+        assert await tool.on_invoke_tool(context, "{}") == expected
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ from agents._tool_identity import (
     get_tool_call_qualified_name,
     get_tool_call_trace_name,
     is_reserved_synthetic_tool_namespace,
+    normalize_function_tool_name,
     serialize_function_tool_lookup_key,
     tool_qualified_name,
     tool_trace_name,
@@ -42,6 +43,23 @@ class TestToolQualifiedName:
     def test_ignores_empty_namespace(self) -> None:
         assert tool_qualified_name("search", "") == "search"
         assert tool_qualified_name("search", None) == "search"
+
+
+class TestNormalizeFunctionToolName:
+    def test_normalizes_and_shortens_provider_names(self) -> None:
+        normalized = normalize_function_tool_name("Handler[日本語Payload]" + ("VeryLong" * 10))
+
+        assert len(normalized) <= 64
+        assert all(char.isascii() and (char.isalnum() or char in {"_", "-"}) for char in normalized)
+        assert normalized == normalize_function_tool_name(
+            "Handler[日本語Payload]" + ("VeryLong" * 10)
+        )
+
+    def test_hashes_changed_names_to_avoid_normalization_collisions(self) -> None:
+        assert normalize_function_tool_name("Handler[A]") != normalize_function_tool_name(
+            "Handler(A)"
+        )
+        assert normalize_function_tool_name("safe_name") == "safe_name"
 
 
 class TestIsReservedSyntheticToolNamespace:

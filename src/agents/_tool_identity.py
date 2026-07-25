@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 from typing import Any, Literal, cast
 
@@ -16,6 +17,45 @@ FunctionToolLookupKey = (
     | DeferredTopLevelFunctionToolLookupKey
 )
 NamedToolLookupKey = FunctionToolLookupKey | str
+FUNCTION_TOOL_NAME_MAX_LENGTH = 64
+_FUNCTION_TOOL_NAME_HASH_LENGTH = 8
+
+
+def safe_tool_name_part(value: str, fallback: str) -> str:
+    """Return an API-safe function-tool name component."""
+    safe = "".join(
+        char if char.isascii() and (char.isalnum() or char in {"_", "-"}) else "_" for char in value
+    )
+    safe = safe.strip("_-")
+    return safe or fallback
+
+
+def shorten_tool_name(
+    base_name: str,
+    seed: str,
+    *,
+    force_hash: bool = False,
+    fallback: str = "tool",
+) -> str:
+    """Fit an API-safe function-tool name within the provider length limit."""
+    if not force_hash and len(base_name) <= FUNCTION_TOOL_NAME_MAX_LENGTH:
+        return base_name
+
+    hash_suffix = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:_FUNCTION_TOOL_NAME_HASH_LENGTH]
+    suffix = f"_{hash_suffix}"
+    stem_length = FUNCTION_TOOL_NAME_MAX_LENGTH - len(suffix)
+    stem = base_name[:stem_length].rstrip("_-") or fallback
+    return f"{stem}{suffix}"
+
+
+def normalize_function_tool_name(value: str, fallback: str = "tool") -> str:
+    """Return a canonical provider-safe function-tool name."""
+    safe_name = safe_tool_name_part(value, fallback)
+    return shorten_tool_name(
+        safe_name,
+        seed=value,
+        force_hash=safe_name != value,
+    )
 
 
 class SerializedFunctionToolLookupKey(TypedDict, total=False):

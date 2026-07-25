@@ -6,7 +6,7 @@ from collections.abc import Callable
 from types import UnionType
 from typing import Annotated, Any, get_args, get_origin
 
-from typing_extensions import TypeAliasType
+from typing_extensions import NoDefault, TypeAliasType
 
 _NATIVE_TYPE_ALIAS_TYPE = getattr(typing, "TypeAliasType", TypeAliasType)
 
@@ -37,8 +37,17 @@ def expand_type_alias(annotation: Any, seen: set[Any] | None = None) -> Any:
         return annotation
 
     parameters = get_type_parameters(alias)
-    args = get_args(plain_annotation) or (Any,) * len(parameters)
-    substitutions = dict(zip(parameters, args, strict=False))
+    provided_args = get_args(plain_annotation)
+    substitutions: dict[Any, Any] = {}
+    for index, parameter in enumerate(parameters):
+        if index < len(provided_args):
+            resolved_arg = provided_args[index]
+        else:
+            default = getattr(parameter, "__default__", NoDefault)
+            resolved_arg = (
+                Any if default is NoDefault else substitute_typevars(default, substitutions)
+            )
+        substitutions[parameter] = resolved_arg
     expanded = substitute_typevars(alias.__value__, substitutions)
     expanded = expand_type_alias(expanded, {*seen_aliases, alias})
     return Annotated[(expanded, *metadata)] if metadata else expanded
@@ -151,11 +160,27 @@ def resolve_typevar_substitutions(
             return {}
 
         next_seen = {*seen, owner}
-        for base in getattr(owner, "__orig_bases__", ()):
+        bases = [
+            *getattr(owner, "__bases__", ()),
+            *getattr(owner, "__orig_bases__", ()),
+        ]
+        for base in bases:
             base_origin = get_origin(base) or base
             if not isinstance(base_origin, type):
                 continue
-            base_args = tuple(substitute_typevars(arg, substitutions) for arg in get_args(base))
+            base_args = get_args(base)
+            pydantic_base_metadata = getattr(
+                base_origin,
+                "__pydantic_generic_metadata__",
+                None,
+            )
+            if isinstance(pydantic_base_metadata, dict):
+                pydantic_base_origin = pydantic_base_metadata.get("origin")
+                pydantic_base_args = pydantic_base_metadata.get("args")
+                if isinstance(pydantic_base_origin, type) and isinstance(pydantic_base_args, tuple):
+                    base_origin = pydantic_base_origin
+                    base_args = pydantic_base_args
+            base_args = tuple(substitute_typevars(arg, substitutions) for arg in base_args)
             base_substitutions = dict(
                 zip(get_type_parameters(base_origin), base_args, strict=False)
             )

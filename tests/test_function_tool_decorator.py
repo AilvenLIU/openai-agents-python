@@ -1370,16 +1370,28 @@ def test_nested_partialmethod_cannot_positionally_bind_context() -> None:
 
 @pytest.mark.asyncio
 async def test_async_only_singledispatchmethod_supports_timeout() -> None:
+    sync_thread_ids: list[int] = []
+
     class Handler:
         @functools.singledispatchmethod
-        async def __call__(self, value: int) -> int:
+        async def __call__(self, value: int | str) -> str:
             await asyncio.sleep(0)
-            return value * 2
+            return f"async:{value}"
 
     tool = function_tool(Handler(), timeout=1)
 
     assert tool.timeout_seconds == 1
-    assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == 8
+    assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": 4}') == "async:4"
+
+    def handle_str(self: Handler, value: str) -> str:
+        sync_thread_ids.append(threading.get_ident())
+        return f"sync:{value}"
+
+    cast(Any, Handler.__dict__["__call__"]).register(str, handle_str)
+
+    assert await tool.on_invoke_tool(ctx_wrapper(), '{"value": "four"}') == "sync:four"
+    assert sync_thread_ids
+    assert sync_thread_ids[0] != threading.get_ident()
 
 
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 requires Python 3.12")
@@ -1429,6 +1441,28 @@ async def test_pydantic_generic_callable_applies_specialization() -> None:
         Handler[WrappedPayload](),
         allowed_callers=["programmatic"],
     )
+
+    assert tool.name.startswith("Handler_WrappedPayload_")
+    assert len(tool.name) <= 64
+    assert tool.params_json_schema["properties"]["value"]["$ref"] == "#/$defs/WrappedPayload"
+    assert tool.output_json_schema is not None
+    assert tool.output_json_schema["title"] == "WrappedPayload"
+    assert await tool.on_invoke_tool(
+        ctx_wrapper(),
+        '{"value": {"value": 4}}',
+    ) == WrappedPayload(value=4)
+
+
+@pytest.mark.asyncio
+async def test_named_pydantic_generic_callable_applies_specialization() -> None:
+    class Handler(BaseModel, Generic[CallableValueT]):
+        async def __call__(self, value: CallableValueT) -> CallableValueT:
+            return value
+
+    class WrappedHandler(Handler[WrappedPayload]):
+        pass
+
+    tool = function_tool(WrappedHandler(), allowed_callers=["programmatic"])
 
     assert tool.params_json_schema["properties"]["value"]["$ref"] == "#/$defs/WrappedPayload"
     assert tool.output_json_schema is not None
