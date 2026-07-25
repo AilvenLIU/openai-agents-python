@@ -395,6 +395,65 @@ async def test_callable_wrapper_preserves_published_annotations() -> None:
 
 
 @pytest.mark.asyncio
+async def test_callable_wrapper_resolves_copied_annotations_in_target_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decorator_module_name = "tests._function_tool_callable_decorator_module"
+    target_module_name = "tests._function_tool_callable_target_module"
+    decorator_module = ModuleType(decorator_module_name)
+    target_module = ModuleType(target_module_name)
+    monkeypatch.setitem(sys.modules, decorator_module_name, decorator_module)
+    monkeypatch.setitem(sys.modules, target_module_name, target_module)
+
+    exec(
+        """
+import functools
+from typing import Any
+from pydantic import BaseModel
+
+class Payload(BaseModel):
+    wrapper_value: str
+
+class Wrapper:
+    def __init__(self, wrapped: Any) -> None:
+        self.wrapped = wrapped
+        functools.update_wrapper(self, wrapped)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.wrapped(*args, **kwargs)
+""",
+        decorator_module.__dict__,
+    )
+    exec(
+        """
+from __future__ import annotations
+from pydantic import BaseModel
+
+class Payload(BaseModel):
+    target_value: int
+
+def target(payload: Payload) -> str:
+    return str(payload.target_value)
+""",
+        target_module.__dict__,
+    )
+
+    decorator_namespace = cast(Any, decorator_module)
+    target_namespace = cast(Any, target_module)
+    tool = function_tool(decorator_namespace.Wrapper(target_namespace.target))
+
+    payload_schema = tool.params_json_schema["$defs"]["Payload"]
+    assert list(payload_schema["properties"]) == ["target_value"]
+    assert (
+        await tool.on_invoke_tool(
+            ctx_wrapper(),
+            '{"payload": {"target_value": 4}}',
+        )
+        == "4"
+    )
+
+
+@pytest.mark.asyncio
 async def test_partial_wrapper_preserves_published_contract() -> None:
     def target(payload: WrappedPayload) -> str:
         """Read a wrapped payload.

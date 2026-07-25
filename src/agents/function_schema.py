@@ -322,7 +322,16 @@ def _get_callable_type_hints(
         instance_vars = {}
 
     if "__annotations__" in instance_vars or "__annotate__" in instance_vars:
-        globalns, localns = _get_callable_annotation_namespaces(func)
+        annotation_namespace_source = func
+        unwrapped = inspect.unwrap(func)
+        if unwrapped is not func:
+            for attribute in ("__annotations__", "__annotate__"):
+                published = instance_vars.get(attribute, _CONTEXT_NOT_PROVIDED)
+                wrapped = getattr(unwrapped, attribute, _CONTEXT_NOT_PROVIDED)
+                if published is not _CONTEXT_NOT_PROVIDED and published is wrapped:
+                    annotation_namespace_source = unwrapped
+                    break
+        globalns, localns = _get_callable_annotation_namespaces(annotation_namespace_source)
         try:
             published_hints = get_type_hints(
                 func,
