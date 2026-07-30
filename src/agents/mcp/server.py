@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar, Union, cast
 
 import anyio
 import httpx
@@ -290,6 +290,11 @@ class MCPServer(abc.ABC):
         """A readable name for the server."""
         pass
 
+    @property
+    def _error_name(self) -> str:
+        """Return a diagnostic server name with URL credentials removed."""
+        return get_mcp_server_log_name(self.name)
+
     @abc.abstractmethod
     async def cleanup(self):
         """Cleanup the server. For example, this might mean closing a subprocess or
@@ -355,7 +360,7 @@ class MCPServer(abc.ABC):
         unimplemented; it will raise :exc:`NotImplementedError` at call time.
         """
         raise NotImplementedError(
-            f"MCP server '{self.name}' does not support list_resources. "
+            f"MCP server '{self._error_name}' does not support list_resources. "
             "Override this method in your server implementation."
         )
 
@@ -377,7 +382,7 @@ class MCPServer(abc.ABC):
         call time.
         """
         raise NotImplementedError(
-            f"MCP server '{self.name}' does not support list_resource_templates. "
+            f"MCP server '{self._error_name}' does not support list_resource_templates. "
             "Override this method in your server implementation."
         )
 
@@ -393,7 +398,7 @@ class MCPServer(abc.ABC):
         :exc:`NotImplementedError` at call time.
         """
         raise NotImplementedError(
-            f"MCP server '{self.name}' does not support read_resource. "
+            f"MCP server '{self._error_name}' does not support read_resource. "
             "Override this method in your server implementation."
         )
 
@@ -751,9 +756,9 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
 
         return None
 
-    def _raise_user_error_for_http_error(self, http_error: Exception) -> None:
-        """Raise appropriate UserError for HTTP error."""
-        error_message = f"Failed to connect to MCP server '{self.name}': "
+    def _user_error_for_http_error(self, http_error: Exception) -> UserError:
+        """Build a UserError from safe HTTP diagnostics."""
+        error_message = f"Failed to connect to MCP server '{self._error_name}': "
         if isinstance(http_error, httpx.HTTPStatusError):
             error_message += f"HTTP error {http_error.response.status_code} ({http_error.response.reason_phrase})"  # noqa: E501
 
@@ -763,7 +768,37 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         elif isinstance(http_error, httpx.TimeoutException):
             error_message += "Connection timeout."
 
-        raise UserError(error_message) from http_error
+        return UserError(error_message)
+
+    @staticmethod
+    def _safe_transport_cause(http_error: Exception) -> Exception | None:
+        """Keep a transport cause only when its request URLs need no sanitization."""
+        if not isinstance(http_error, httpx.HTTPStatusError | httpx.RequestError):
+            return http_error
+
+        request_urls: list[str] = []
+        try:
+            request_urls.append(str(http_error.request.url))
+        except RuntimeError:
+            pass
+
+        if isinstance(http_error, httpx.HTTPStatusError):
+            for response in http_error.response.history:
+                try:
+                    request_urls.append(str(response.request.url))
+                except RuntimeError:
+                    continue
+
+        return (
+            http_error if all(get_mcp_server_log_name(url) == url for url in request_urls) else None
+        )
+
+    @staticmethod
+    def _raise_mapped_transport_error(error: UserError, cause: Exception | None) -> NoReturn:
+        """Raise a mapped transport error without retaining unsafe URL data."""
+        if cause is None:
+            raise error from None
+        raise error from cause
 
     async def _run_with_retries(self, func: Callable[[], Awaitable[T]]) -> T:
         attempts = 0
@@ -780,6 +815,8 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
     async def connect(self):
         """Connect to the server."""
         connection_succeeded = False
+        connection_error: UserError | None = None
+        connection_cause: Exception | None = None
         try:
             transport = await self.exit_stack.enter_async_context(self.create_streams())
             # streamablehttp_client returns (read, write, get_session_id)
@@ -807,19 +844,22 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             # Try to extract HTTP error from exception or ExceptionGroup
             http_error = self._extract_http_error_from_exception(e)
             if http_error:
-                self._raise_user_error_for_http_error(http_error)
+                connection_error = self._user_error_for_http_error(http_error)
+                connection_cause = self._safe_transport_cause(http_error)
 
             # For CancelledError, preserve cancellation semantics - don't wrap it.
             # If it's masking an HTTP error, cleanup() will extract and raise UserError.
-            if isinstance(e, asyncio.CancelledError):
+            elif isinstance(e, asyncio.CancelledError):
                 raise
 
             # For HTTP-related errors, wrap them
-            if isinstance(e, httpx.HTTPStatusError | httpx.ConnectError | httpx.TimeoutException):
-                self._raise_user_error_for_http_error(e)
+            elif isinstance(e, httpx.HTTPStatusError | httpx.ConnectError | httpx.TimeoutException):
+                connection_error = self._user_error_for_http_error(e)
+                connection_cause = self._safe_transport_cause(e)
 
             # For other errors, re-raise as-is (don't wrap non-HTTP errors)
-            raise
+            else:
+                raise
         finally:
             # Always attempt cleanup on error, but suppress cleanup errors that mask the original
             if not connection_succeeded:
@@ -851,6 +891,9 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
                             cleanup_error,
                         )
 
+        if connection_error is not None:
+            self._raise_mapped_transport_error(connection_error, connection_cause)
+
     async def list_tools(
         self,
         run_context: RunContextWrapper[Any] | None = None,
@@ -862,6 +905,8 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         session = self.session
         assert session is not None
 
+        transport_error: UserError | None = None
+        transport_cause: Exception | None = None
         try:
             # Return from cache if caching is enabled, we have tools, and the cache is not dirty
             if self.cache_tools_list and not self._cache_dirty and self._tools_list:
@@ -882,14 +927,20 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             return filtered_tools
         except httpx.HTTPStatusError as e:
             status_code = e.response.status_code
-            raise UserError(
-                f"Failed to list tools from MCP server '{self.name}': HTTP error {status_code}"
-            ) from e
+            transport_error = UserError(
+                f"Failed to list tools from MCP server '{self._error_name}': "
+                f"HTTP error {status_code}"
+            )
+            transport_cause = self._safe_transport_cause(e)
         except httpx.ConnectError as e:
-            raise UserError(
-                f"Failed to list tools from MCP server '{self.name}': Connection lost. "
+            transport_error = UserError(
+                f"Failed to list tools from MCP server '{self._error_name}': Connection lost. "
                 f"The server may have disconnected."
-            ) from e
+            )
+            transport_cause = self._safe_transport_cause(e)
+
+        assert transport_error is not None
+        self._raise_mapped_transport_error(transport_error, transport_cause)
 
     async def call_tool(
         self,
@@ -903,6 +954,8 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         session = self.session
         assert session is not None
 
+        transport_error: UserError | None = None
+        transport_cause: Exception | None = None
         try:
             self._validate_required_parameters(tool_name=tool_name, arguments=arguments)
             if meta is None:
@@ -918,15 +971,20 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             )
         except httpx.HTTPStatusError as e:
             status_code = e.response.status_code
-            raise UserError(
-                f"Failed to call tool '{tool_name}' on MCP server '{self.name}': "
+            transport_error = UserError(
+                f"Failed to call tool '{tool_name}' on MCP server '{self._error_name}': "
                 f"HTTP error {status_code}"
-            ) from e
+            )
+            transport_cause = self._safe_transport_cause(e)
         except httpx.ConnectError as e:
-            raise UserError(
-                f"Failed to call tool '{tool_name}' on MCP server '{self.name}': Connection lost. "
-                f"The server may have disconnected."
-            ) from e
+            transport_error = UserError(
+                f"Failed to call tool '{tool_name}' on MCP server '{self._error_name}': "
+                f"Connection lost. The server may have disconnected."
+            )
+            transport_cause = self._safe_transport_cause(e)
+
+        assert transport_error is not None
+        self._raise_mapped_transport_error(transport_error, transport_cause)
 
     def _validate_required_parameters(
         self, tool_name: str, arguments: dict[str, Any] | None
@@ -949,7 +1007,7 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             arguments_to_validate = arguments
         else:
             raise UserError(
-                f"Failed to call tool '{tool_name}' on MCP server '{self.name}': "
+                f"Failed to call tool '{tool_name}' on MCP server '{self._error_name}': "
                 "arguments must be an object."
             )
 
@@ -958,7 +1016,7 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         if missing:
             missing_text = ", ".join(sorted(missing))
             raise UserError(
-                f"Failed to call tool '{tool_name}' on MCP server '{self.name}': "
+                f"Failed to call tool '{tool_name}' on MCP server '{self._error_name}': "
                 f"missing required parameters: {missing_text}"
             )
 
@@ -1022,6 +1080,8 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             # During normal teardown (via __aexit__), log but don't raise to avoid
             # masking the original exception.
             is_failed_connection_cleanup = self.session is None
+            cleanup_error: UserError | None = None
+            cleanup_cause: Exception | None = None
 
             try:
                 await self.exit_stack.aclose()
@@ -1038,7 +1098,6 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
                 http_error = None
                 connect_error = None
                 timeout_error = None
-                error_message = f"Failed to connect to MCP server '{self.name}': "
 
                 for exc in eg.exceptions:
                     if isinstance(exc, httpx.HTTPStatusError):
@@ -1052,8 +1111,8 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
                 # During normal teardown, log them instead.
                 if http_error:
                     if is_failed_connection_cleanup:
-                        error_message += f"HTTP error {http_error.response.status_code} ({http_error.response.reason_phrase})"  # noqa: E501
-                        raise UserError(error_message) from http_error
+                        cleanup_error = self._user_error_for_http_error(http_error)
+                        cleanup_cause = self._safe_transport_cause(http_error)
                     else:
                         # Normal teardown - log but don't raise
                         log_tool_action_warning(
@@ -1065,8 +1124,8 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
                         )
                 elif connect_error:
                     if is_failed_connection_cleanup:
-                        error_message += "Could not reach the server."
-                        raise UserError(error_message) from connect_error
+                        cleanup_error = self._user_error_for_http_error(connect_error)
+                        cleanup_cause = self._safe_transport_cause(connect_error)
                     else:
                         log_tool_action_warning(
                             logger,
@@ -1077,8 +1136,8 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
                         )
                 elif timeout_error:
                     if is_failed_connection_cleanup:
-                        error_message += "Connection timeout."
-                        raise UserError(error_message) from timeout_error
+                        cleanup_error = self._user_error_for_http_error(timeout_error)
+                        cleanup_cause = self._safe_transport_cause(timeout_error)
                     else:
                         log_tool_action_warning(
                             logger,
@@ -1127,6 +1186,9 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             finally:
                 self.session = None
                 self._get_session_id = None
+
+            if cleanup_error is not None:
+                self._raise_mapped_transport_error(cleanup_error, cleanup_cause)
 
 
 class MCPServerStdioParams(TypedDict):
@@ -1654,6 +1716,8 @@ class MCPServerStreamableHttp(_MCPServerWithClientSession):
         if not self.session:
             raise UserError("Server not initialized. Make sure you call `connect()` first.")
 
+        transport_error: UserError | None = None
+        transport_cause: Exception | None = None
         try:
             self._validate_required_parameters(tool_name=tool_name, arguments=arguments)
             retries_used = 0
@@ -1690,34 +1754,41 @@ class MCPServerStreamableHttp(_MCPServerWithClientSession):
                 first_attempt = False
         except httpx.HTTPStatusError as e:
             status_code = e.response.status_code
-            raise UserError(
-                f"Failed to call tool '{tool_name}' on MCP server '{self.name}': "
+            transport_error = UserError(
+                f"Failed to call tool '{tool_name}' on MCP server '{self._error_name}': "
                 f"HTTP error {status_code}"
-            ) from e
+            )
+            transport_cause = self._safe_transport_cause(e)
         except httpx.ConnectError as e:
-            raise UserError(
-                f"Failed to call tool '{tool_name}' on MCP server '{self.name}': Connection lost. "
-                f"The server may have disconnected."
-            ) from e
+            transport_error = UserError(
+                f"Failed to call tool '{tool_name}' on MCP server '{self._error_name}': "
+                f"Connection lost. The server may have disconnected."
+            )
+            transport_cause = self._safe_transport_cause(e)
         except BaseExceptionGroup as e:
             http_error = self._extract_http_error_from_exception(e)
             if isinstance(http_error, httpx.HTTPStatusError):
                 status_code = http_error.response.status_code
-                raise UserError(
-                    f"Failed to call tool '{tool_name}' on MCP server '{self.name}': "
+                transport_error = UserError(
+                    f"Failed to call tool '{tool_name}' on MCP server '{self._error_name}': "
                     f"HTTP error {status_code}"
-                ) from http_error
-            if isinstance(http_error, httpx.ConnectError):
-                raise UserError(
-                    f"Failed to call tool '{tool_name}' on MCP server '{self.name}': "
+                )
+            elif isinstance(http_error, httpx.ConnectError):
+                transport_error = UserError(
+                    f"Failed to call tool '{tool_name}' on MCP server '{self._error_name}': "
                     "Connection lost. The server may have disconnected."
-                ) from http_error
-            if isinstance(http_error, httpx.TimeoutException):
-                raise UserError(
-                    f"Failed to call tool '{tool_name}' on MCP server '{self.name}': "
+                )
+            elif isinstance(http_error, httpx.TimeoutException):
+                transport_error = UserError(
+                    f"Failed to call tool '{tool_name}' on MCP server '{self._error_name}': "
                     "Connection timeout."
-                ) from http_error
-            raise
+                )
+            else:
+                raise
+            transport_cause = self._safe_transport_cause(http_error)
+
+        assert transport_error is not None
+        self._raise_mapped_transport_error(transport_error, transport_cause)
 
     @property
     def name(self) -> str:
