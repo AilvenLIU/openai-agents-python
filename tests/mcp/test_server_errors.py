@@ -257,6 +257,33 @@ async def test_resource_request_nested_group_hides_url_credentials():
 
 
 @pytest.mark.asyncio
+async def test_resource_request_mixed_group_preserves_cancellation():
+    server = MCPServerStreamableHttp(params={"url": _CREDENTIALED_URL})
+    cancellation = asyncio.CancelledError("request cancelled")
+    request_error = httpx.ConnectError(
+        "connection failed",
+        request=httpx.Request("GET", _CREDENTIALED_URL),
+    )
+    error_group = BaseExceptionGroup(
+        "request failed",
+        [cancellation, request_error],
+    )
+    session = MagicMock()
+    session.read_resource = AsyncMock(side_effect=error_group)
+    server.session = session
+
+    with pytest.raises(BaseExceptionGroup) as error_group_info:
+        await server.read_resource("file:///safe.txt")
+
+    propagated_group = error_group_info.value
+    assert propagated_group.exceptions == (cancellation,)
+    _assert_url_credentials_hidden(propagated_group)
+    _assert_not_retained_in_traceback_locals(propagated_group, error_group)
+    _assert_not_retained_in_traceback_locals(propagated_group, request_error)
+    _assert_url_credentials_hidden_from_traceback_locals(propagated_group)
+
+
+@pytest.mark.asyncio
 async def test_resource_request_preserves_safe_nested_group():
     server = MCPServerStreamableHttp(params={"url": _SAFE_URL})
     request_error = httpx.ConnectError(

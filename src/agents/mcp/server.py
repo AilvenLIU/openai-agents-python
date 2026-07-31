@@ -850,6 +850,7 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
     ) -> T:
         """Run an MCP request without retaining credential-bearing HTTP errors."""
         transport_error: UserError | None = None
+        base_error_group: BaseExceptionGroup | None = None
         try:
             return await func()
         except (httpx.HTTPStatusError, httpx.RequestError) as http_error:
@@ -861,13 +862,18 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             unsafe_http_error = _first_unsafe_transport_error(http_errors)
             if unsafe_http_error is None:
                 raise
-            transport_error = self._user_error_for_request_operation(
-                operation,
-                unsafe_http_error,
-            )
+            # The second split group contains cancellation and other non-Exception leaves.
+            base_error_group = error_group.split(Exception)[1]
+            if base_error_group is None:
+                transport_error = self._user_error_for_request_operation(
+                    operation,
+                    unsafe_http_error,
+                )
             http_errors.clear()
             del unsafe_http_error
 
+        if base_error_group is not None:
+            raise base_error_group
         assert transport_error is not None
         self._raise_mapped_transport_error(transport_error, None)
 
