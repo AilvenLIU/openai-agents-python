@@ -333,15 +333,17 @@ class StreamedAudioResult:
 
         # On the normal completion path, let the producer task finish gracefully so any active
         # trace context can emit `trace_end` before we run cleanup.
-        if (
-            saw_session_end
-            and self.text_generation_task is not None
-            and not self.text_generation_task.done()
-        ):
-            await asyncio.shield(self.text_generation_task)
+        try:
+            if (
+                saw_session_end
+                and self.text_generation_task is not None
+                and not self.text_generation_task.done()
+            ):
+                await asyncio.shield(self.text_generation_task)
 
-        self._check_errors()
-        self._cleanup_tasks()
+            self._check_errors()
+        finally:
+            self._cleanup_tasks()
 
         if self._stored_exception:
             raise self._stored_exception

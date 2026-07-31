@@ -289,6 +289,32 @@ async def test_streamed_audio_dispatcher_handles_stream_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_voice_pipeline_cleans_up_turn_span_after_tts_failure() -> None:
+    """A public pipeline stream must finish its active turn span when TTS fails."""
+
+    class FailingTTS(FakeTTS):
+        async def run(self, text: str, settings: TTSModelSettings):
+            del text, settings
+            raise RuntimeError("tts-failure")
+            yield b""  # pragma: no cover
+
+    pipeline = VoicePipeline(
+        workflow=FakeWorkflow([["A complete sentence."]]),
+        stt_model=FakeSTT(["user input"]),
+        tts_model=FailingTTS(),
+    )
+    result = await pipeline.run(AudioInput(buffer=np.zeros(2, dtype=np.int16)))
+
+    with pytest.raises(RuntimeError, match="tts-failure"):
+        async for _event in result.stream():
+            pass
+
+    assert result._tracing_span is None
+    assert result.text_generation_task is not None
+    assert result.text_generation_task.done()
+
+
+@pytest.mark.asyncio
 async def test_streamed_audio_dispatcher_blocks_until_work_is_available() -> None:
     """The dispatcher must block while idle without losing a pre-wait notification."""
 

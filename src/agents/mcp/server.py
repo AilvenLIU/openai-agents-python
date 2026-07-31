@@ -136,6 +136,24 @@ def _first_unsafe_transport_error(http_errors: list[Exception]) -> Exception | N
     return next((error for error in http_errors if _safe_transport_cause(error) is None), None)
 
 
+def _is_unsafe_transport_error(error: BaseException) -> bool:
+    """Return whether an exception carries an HTTPX URL that requires sanitization."""
+    return isinstance(error, httpx.HTTPStatusError | httpx.RequestError) and (
+        _safe_transport_cause(error) is None
+    )
+
+
+def _detach_exception_group_tracebacks(error_group: BaseExceptionGroup) -> BaseExceptionGroup:
+    """Rebuild an exception group without retaining traceback links from the source group."""
+    detached_exceptions = [
+        _detach_exception_group_tracebacks(error)
+        if isinstance(error, BaseExceptionGroup)
+        else error
+        for error in error_group.exceptions
+    ]
+    return BaseExceptionGroup(error_group.message, detached_exceptions)
+
+
 def _log_transport_warning(message: str, http_error: Exception) -> None:
     """Log a transport failure without attaching credential-bearing request URLs."""
     if _debug.DONT_LOG_TOOL_DATA:
@@ -862,15 +880,19 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             unsafe_http_error = _first_unsafe_transport_error(http_errors)
             if unsafe_http_error is None:
                 raise
-            # The second split group contains cancellation and other non-Exception leaves.
-            base_error_group = error_group.split(Exception)[1]
-            if base_error_group is None:
+            unsafe_group, remaining_group = error_group.split(_is_unsafe_transport_error)
+            assert unsafe_group is not None
+            if remaining_group is None:
                 transport_error = self._user_error_for_request_operation(
                     operation,
                     unsafe_http_error,
                 )
+            else:
+                base_error_group = _detach_exception_group_tracebacks(remaining_group)
             http_errors.clear()
             del unsafe_http_error
+            del unsafe_group
+            del remaining_group
 
         if base_error_group is not None:
             raise base_error_group

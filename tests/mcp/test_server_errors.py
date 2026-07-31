@@ -229,16 +229,17 @@ async def test_prompt_request_http_status_hides_url_credentials():
 
 
 @pytest.mark.asyncio
-async def test_resource_request_nested_group_hides_url_credentials():
+async def test_resource_request_nested_group_preserves_ordinary_siblings():
     server = MCPServerStreamableHttp(params={"url": _CREDENTIALED_URL})
     request_error = httpx.ConnectError(
         "connection failed",
         request=httpx.Request("GET", _CREDENTIALED_URL),
     )
+    ordinary_error = ValueError("ordinary sibling failure")
     error_group = BaseExceptionGroup(
         "request failed",
         [
-            ValueError("ordinary sibling failure"),
+            ordinary_error,
             BaseExceptionGroup("transport failed", [request_error]),
         ],
     )
@@ -246,14 +247,15 @@ async def test_resource_request_nested_group_hides_url_credentials():
     session.read_resource = AsyncMock(side_effect=error_group)
     server.session = session
 
-    with pytest.raises(UserError) as user_error_info:
+    with pytest.raises(BaseExceptionGroup) as error_group_info:
         await server.read_resource("file:///safe.txt")
 
-    assert "Connection lost" in str(user_error_info.value)
-    _assert_url_credentials_hidden(user_error_info.value)
-    _assert_not_retained_in_traceback_locals(user_error_info.value, error_group)
-    _assert_not_retained_in_traceback_locals(user_error_info.value, request_error)
-    _assert_url_credentials_hidden_from_traceback_locals(user_error_info.value)
+    propagated_group = error_group_info.value
+    assert propagated_group.exceptions == (ordinary_error,)
+    _assert_url_credentials_hidden(propagated_group)
+    _assert_not_retained_in_traceback_locals(propagated_group, error_group)
+    _assert_not_retained_in_traceback_locals(propagated_group, request_error)
+    _assert_url_credentials_hidden_from_traceback_locals(propagated_group)
 
 
 @pytest.mark.asyncio
@@ -264,12 +266,19 @@ async def test_resource_request_mixed_group_preserves_cancellation():
         "connection failed",
         request=httpx.Request("GET", _CREDENTIALED_URL),
     )
-    error_group = BaseExceptionGroup(
-        "request failed",
-        [cancellation, request_error],
-    )
+    error_group: BaseExceptionGroup | None = None
+
+    async def raise_mixed_group(uri: object) -> None:
+        del uri
+        nonlocal error_group
+        error_group = BaseExceptionGroup(
+            "request failed",
+            [cancellation, request_error],
+        )
+        raise error_group
+
     session = MagicMock()
-    session.read_resource = AsyncMock(side_effect=error_group)
+    session.read_resource = raise_mixed_group
     server.session = session
 
     with pytest.raises(BaseExceptionGroup) as error_group_info:
@@ -278,9 +287,16 @@ async def test_resource_request_mixed_group_preserves_cancellation():
     propagated_group = error_group_info.value
     assert propagated_group.exceptions == (cancellation,)
     _assert_url_credentials_hidden(propagated_group)
+    assert error_group is not None
     _assert_not_retained_in_traceback_locals(propagated_group, error_group)
     _assert_not_retained_in_traceback_locals(propagated_group, request_error)
     _assert_url_credentials_hidden_from_traceback_locals(propagated_group)
+    traceback_frames = []
+    current = propagated_group.__traceback__
+    while current is not None:
+        traceback_frames.append(current.tb_frame)
+        current = current.tb_next
+    assert all(frame.f_code.co_name != "raise_mixed_group" for frame in traceback_frames)
 
 
 @pytest.mark.asyncio
