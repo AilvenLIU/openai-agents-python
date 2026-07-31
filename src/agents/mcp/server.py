@@ -826,6 +826,51 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             raise error from None
         raise error from cause
 
+    def _user_error_for_request_operation(
+        self,
+        operation: str,
+        http_error: Exception,
+    ) -> UserError:
+        """Build a credential-safe error for an MCP request operation."""
+        error_message = f"Failed to {operation} on MCP server '{self._error_name}': "
+        if isinstance(http_error, httpx.HTTPStatusError):
+            error_message += f"HTTP error {http_error.response.status_code}"
+        elif isinstance(http_error, httpx.ConnectError):
+            error_message += "Connection lost. The server may have disconnected."
+        elif isinstance(http_error, httpx.TimeoutException):
+            error_message += "Connection timeout."
+        else:
+            error_message += "Request failed."
+        return UserError(error_message)
+
+    async def _run_request_with_transport_error_redaction(
+        self,
+        operation: str,
+        func: Callable[[], Awaitable[T]],
+    ) -> T:
+        """Run an MCP request without retaining credential-bearing HTTP errors."""
+        transport_error: UserError | None = None
+        try:
+            return await func()
+        except (httpx.HTTPStatusError, httpx.RequestError) as http_error:
+            if _safe_transport_cause(http_error) is not None:
+                raise
+            transport_error = self._user_error_for_request_operation(operation, http_error)
+        except BaseExceptionGroup as error_group:
+            http_errors = self._extract_http_errors_from_exception(error_group)
+            unsafe_http_error = _first_unsafe_transport_error(http_errors)
+            if unsafe_http_error is None:
+                raise
+            transport_error = self._user_error_for_request_operation(
+                operation,
+                unsafe_http_error,
+            )
+            http_errors.clear()
+            del unsafe_http_error
+
+        assert transport_error is not None
+        self._raise_mapped_transport_error(transport_error, None)
+
     async def _run_with_retries(self, func: Callable[[], Awaitable[T]]) -> T:
         attempts = 0
         while True:
@@ -1079,7 +1124,10 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             raise UserError("Server not initialized. Make sure you call `connect()` first.")
         session = self.session
         assert session is not None
-        return await self._maybe_serialize_request(lambda: session.list_prompts())
+        return await self._run_request_with_transport_error_redaction(
+            "list prompts",
+            lambda: self._maybe_serialize_request(lambda: session.list_prompts()),
+        )
 
     async def get_prompt(
         self, name: str, arguments: dict[str, Any] | None = None
@@ -1089,7 +1137,10 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             raise UserError("Server not initialized. Make sure you call `connect()` first.")
         session = self.session
         assert session is not None
-        return await self._maybe_serialize_request(lambda: session.get_prompt(name, arguments))
+        return await self._run_request_with_transport_error_redaction(
+            "get prompt",
+            lambda: self._maybe_serialize_request(lambda: session.get_prompt(name, arguments)),
+        )
 
     async def list_resources(self, cursor: str | None = None) -> ListResourcesResult:
         """List the resources available on the server."""
@@ -1097,7 +1148,10 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             raise UserError("Server not initialized. Make sure you call `connect()` first.")
         session = self.session
         assert session is not None
-        return await self._maybe_serialize_request(lambda: session.list_resources(cursor))
+        return await self._run_request_with_transport_error_redaction(
+            "list resources",
+            lambda: self._maybe_serialize_request(lambda: session.list_resources(cursor)),
+        )
 
     async def list_resource_templates(
         self, cursor: str | None = None
@@ -1107,7 +1161,10 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             raise UserError("Server not initialized. Make sure you call `connect()` first.")
         session = self.session
         assert session is not None
-        return await self._maybe_serialize_request(lambda: session.list_resource_templates(cursor))
+        return await self._run_request_with_transport_error_redaction(
+            "list resource templates",
+            lambda: self._maybe_serialize_request(lambda: session.list_resource_templates(cursor)),
+        )
 
     async def read_resource(self, uri: str) -> ReadResourceResult:
         """Read the contents of a specific resource by URI.
@@ -1122,7 +1179,10 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         assert session is not None
         from pydantic import AnyUrl
 
-        return await self._maybe_serialize_request(lambda: session.read_resource(AnyUrl(uri)))
+        return await self._run_request_with_transport_error_redaction(
+            "read resource",
+            lambda: self._maybe_serialize_request(lambda: session.read_resource(AnyUrl(uri))),
+        )
 
     async def cleanup(self):
         """Cleanup the server."""

@@ -29,6 +29,13 @@ _CREDENTIALED_URL = (
 )
 _URL_SECRETS = ("user", "s3cr3t_pw", "SECRET_QS_KEY", "SECRET_FRAGMENT")
 _SAFE_URL = "https://mcp.example.com/sse"
+_PROMPT_RESOURCE_OPERATIONS = [
+    ("list_prompts", (), "list prompts"),
+    ("get_prompt", ("safe_prompt", None), "get prompt"),
+    ("list_resources", (None,), "list resources"),
+    ("list_resource_templates", (None,), "list resource templates"),
+    ("read_resource", ("file:///safe.txt",), "read resource"),
+]
 
 
 def _assert_url_credentials_hidden(error: BaseException) -> None:
@@ -45,6 +52,16 @@ def _assert_not_retained_in_traceback_locals(error: BaseException, sensitive_val
     while current is not None:
         if current.tb_frame.f_code.co_filename.endswith("/src/agents/mcp/server.py"):
             assert all(value is not sensitive_value for value in current.tb_frame.f_locals.values())
+        current = current.tb_next
+
+
+def _assert_url_credentials_hidden_from_traceback_locals(error: BaseException) -> None:
+    current = error.__traceback__
+    while current is not None:
+        if current.tb_frame.f_code.co_filename.endswith("/src/agents/mcp/server.py"):
+            attached_values = repr(tuple(current.tb_frame.f_locals.values()))
+            for secret in _URL_SECRETS:
+                assert secret not in attached_values
         current = current.tb_next
 
 
@@ -124,6 +141,137 @@ async def test_not_calling_connect_causes_error():
 
     with pytest.raises(UserError):
         await server.call_tool("foo", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "args", "operation"),
+    _PROMPT_RESOURCE_OPERATIONS,
+)
+@pytest.mark.parametrize("redacted", [True, False])
+async def test_prompt_and_resource_request_errors_hide_url_credentials(
+    monkeypatch,
+    caplog,
+    method_name: str,
+    args: tuple[object, ...],
+    operation: str,
+    redacted: bool,
+):
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", redacted)
+    server = MCPServerStreamableHttp(params={"url": _CREDENTIALED_URL})
+    request_error = httpx.ReadError(
+        "request failed",
+        request=httpx.Request("POST", _CREDENTIALED_URL),
+    )
+    session = MagicMock()
+    setattr(session, method_name, AsyncMock(side_effect=request_error))
+    server.session = session
+
+    with caplog.at_level(logging.DEBUG, logger="openai.agents"):
+        with pytest.raises(UserError) as user_error_info:
+            await getattr(server, method_name)(*args)
+
+    assert f"Failed to {operation}" in str(user_error_info.value)
+    assert "mcp.example.com/sse" in str(user_error_info.value)
+    assert "Request failed" in str(user_error_info.value)
+    assert not hasattr(user_error_info.value, "request")
+    _assert_url_credentials_hidden(user_error_info.value)
+    _assert_not_retained_in_traceback_locals(user_error_info.value, request_error)
+    _assert_url_credentials_hidden_from_traceback_locals(user_error_info.value)
+    assert not [record for record in caplog.records if record.name == "openai.agents"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "args", "_operation"),
+    _PROMPT_RESOURCE_OPERATIONS,
+)
+async def test_prompt_and_resource_safe_request_errors_preserve_original_exception(
+    method_name: str,
+    args: tuple[object, ...],
+    _operation: str,
+):
+    server = MCPServerStreamableHttp(params={"url": _SAFE_URL})
+    request_error = httpx.ReadError(
+        "request failed",
+        request=httpx.Request("POST", _SAFE_URL),
+    )
+    session = MagicMock()
+    setattr(session, method_name, AsyncMock(side_effect=request_error))
+    server.session = session
+
+    with pytest.raises(httpx.ReadError) as request_error_info:
+        await getattr(server, method_name)(*args)
+
+    assert request_error_info.value is request_error
+
+
+@pytest.mark.asyncio
+async def test_prompt_request_http_status_hides_url_credentials():
+    server = MCPServerStreamableHttp(params={"url": _CREDENTIALED_URL})
+    request = httpx.Request("GET", _CREDENTIALED_URL)
+    http_error = httpx.HTTPStatusError(
+        "boom",
+        request=request,
+        response=httpx.Response(503, request=request),
+    )
+    session = MagicMock()
+    session.list_prompts = AsyncMock(side_effect=http_error)
+    server.session = session
+
+    with pytest.raises(UserError) as user_error_info:
+        await server.list_prompts()
+
+    assert "HTTP error 503" in str(user_error_info.value)
+    _assert_url_credentials_hidden(user_error_info.value)
+    _assert_not_retained_in_traceback_locals(user_error_info.value, http_error)
+    _assert_url_credentials_hidden_from_traceback_locals(user_error_info.value)
+
+
+@pytest.mark.asyncio
+async def test_resource_request_nested_group_hides_url_credentials():
+    server = MCPServerStreamableHttp(params={"url": _CREDENTIALED_URL})
+    request_error = httpx.ConnectError(
+        "connection failed",
+        request=httpx.Request("GET", _CREDENTIALED_URL),
+    )
+    error_group = BaseExceptionGroup(
+        "request failed",
+        [
+            ValueError("ordinary sibling failure"),
+            BaseExceptionGroup("transport failed", [request_error]),
+        ],
+    )
+    session = MagicMock()
+    session.read_resource = AsyncMock(side_effect=error_group)
+    server.session = session
+
+    with pytest.raises(UserError) as user_error_info:
+        await server.read_resource("file:///safe.txt")
+
+    assert "Connection lost" in str(user_error_info.value)
+    _assert_url_credentials_hidden(user_error_info.value)
+    _assert_not_retained_in_traceback_locals(user_error_info.value, error_group)
+    _assert_not_retained_in_traceback_locals(user_error_info.value, request_error)
+    _assert_url_credentials_hidden_from_traceback_locals(user_error_info.value)
+
+
+@pytest.mark.asyncio
+async def test_resource_request_preserves_safe_nested_group():
+    server = MCPServerStreamableHttp(params={"url": _SAFE_URL})
+    request_error = httpx.ConnectError(
+        "connection failed",
+        request=httpx.Request("GET", _SAFE_URL),
+    )
+    error_group = BaseExceptionGroup("request failed", [request_error])
+    session = MagicMock()
+    session.read_resource = AsyncMock(side_effect=error_group)
+    server.session = session
+
+    with pytest.raises(BaseExceptionGroup) as error_group_info:
+        await server.read_resource("file:///safe.txt")
+
+    assert error_group_info.value is error_group
 
 
 @pytest.mark.asyncio
