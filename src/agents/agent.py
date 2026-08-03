@@ -222,18 +222,26 @@ class AgentBase(Generic[TContext]):
                 reserved_tool_names.add(Handoff.default_tool_name(handoff_item))
         return reserved_tool_names
 
-    async def get_mcp_tools(self, run_context: RunContextWrapper[TContext]) -> list[Tool]:
-        """Fetches the available tools from the MCP servers."""
+    async def _get_mcp_tools_with_handoffs_snapshot(
+        self,
+        run_context: RunContextWrapper[TContext],
+        enabled_handoffs: list[Handoff[Any, Any]] | None,
+    ) -> list[Tool]:
+        """Fetch MCP tools using an optional pre-resolved handoff snapshot."""
         convert_schemas_to_strict = self.mcp_config.get("convert_schemas_to_strict", False)
         failure_error_function = self.mcp_config.get(
             "failure_error_function", default_tool_error_function
         )
         include_server_in_tool_names = self.mcp_config.get("include_server_in_tool_names", False)
-        reserved_tool_names = (
-            await self._get_mcp_tool_reserved_names(run_context)
-            if include_server_in_tool_names
-            else None
-        )
+        reserved_tool_names: set[str] | None = None
+        if include_server_in_tool_names:
+            if enabled_handoffs is None:
+                reserved_tool_names = await self._get_mcp_tool_reserved_names(run_context)
+            else:
+                reserved_tool_names = {
+                    tool.name for tool in self.tools if isinstance(tool, FunctionTool)
+                }
+                reserved_tool_names.update(handoff.tool_name for handoff in enabled_handoffs)
         return await MCPUtil.get_all_function_tools(
             self.mcp_servers,
             convert_schemas_to_strict,
@@ -244,9 +252,31 @@ class AgentBase(Generic[TContext]):
             reserved_tool_names=reserved_tool_names,
         )
 
-    async def get_all_tools(self, run_context: RunContextWrapper[TContext]) -> list[Tool]:
-        """All agent tools, including MCP tools and function tools."""
-        mcp_tools = await self.get_mcp_tools(run_context)
+    async def get_mcp_tools(self, run_context: RunContextWrapper[TContext]) -> list[Tool]:
+        """Fetches the available tools from the MCP servers."""
+        return await self._get_mcp_tools_with_handoffs_snapshot(run_context, None)
+
+    def _uses_custom_get_mcp_tools(self) -> bool:
+        """Return whether tool collection uses a public method override."""
+        return type(self).get_mcp_tools is not AgentBase.get_mcp_tools
+
+    def _uses_custom_get_all_tools(self) -> bool:
+        """Return whether complete tool collection uses a public method override."""
+        return type(self).get_all_tools is not AgentBase.get_all_tools
+
+    async def _get_all_tools_with_handoffs_snapshot(
+        self,
+        run_context: RunContextWrapper[TContext],
+        enabled_handoffs: list[Handoff[Any, Any]] | None,
+    ) -> list[Tool]:
+        """Resolve all tools using an optional pre-resolved handoff snapshot."""
+        if enabled_handoffs is None or self._uses_custom_get_mcp_tools():
+            mcp_tools = await self.get_mcp_tools(run_context)
+        else:
+            mcp_tools = await self._get_mcp_tools_with_handoffs_snapshot(
+                run_context,
+                enabled_handoffs,
+            )
 
         async def _check_tool_enabled(tool: Tool) -> bool:
             if not isinstance(tool, FunctionTool):
@@ -265,6 +295,10 @@ class AgentBase(Generic[TContext]):
         all_tools: list[Tool] = prune_orphaned_tool_search_tools([*mcp_tools, *enabled])
         _validate_codex_tool_name_collisions(all_tools)
         return all_tools
+
+    async def get_all_tools(self, run_context: RunContextWrapper[TContext]) -> list[Tool]:
+        """All agent tools, including MCP tools and function tools."""
+        return await self._get_all_tools_with_handoffs_snapshot(run_context, None)
 
 
 @dataclass

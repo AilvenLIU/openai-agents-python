@@ -1139,9 +1139,11 @@ async def test_resume_rebuilds_deferred_function_runs_from_lookup_key_without_ra
     None
 ):
     """Resumed approvals should use persisted lookup identity when raw namespace is missing."""
+    calls: list[str] = []
 
-    @function_tool(needs_approval=True, name_override="lookup_account")
+    @function_tool(name_override="lookup_account")
     async def visible_lookup_account(customer_id: str) -> str:
+        calls.append("visible")
         return f"visible:{customer_id}"
 
     @function_tool(
@@ -1150,6 +1152,7 @@ async def test_resume_rebuilds_deferred_function_runs_from_lookup_key_without_ra
         defer_loading=True,
     )
     async def deferred_lookup_account(customer_id: str) -> str:
+        calls.append("deferred")
         return f"deferred:{customer_id}"
 
     _model, agent = make_model_and_agent(tools=[visible_lookup_account, deferred_lookup_account])
@@ -1168,12 +1171,23 @@ async def test_resume_rebuilds_deferred_function_runs_from_lookup_key_without_ra
     )
     context_wrapper = make_context_wrapper()
     context_wrapper.approve_tool(approval_item)
+    queued_call = make_function_tool_call(
+        "lookup_account",
+        call_id="call-deferred-rebuild",
+        arguments='{"customer_id":"customer_1"}',
+    )
+    assert isinstance(queued_call, ResponseFunctionToolCall)
 
     run_state = make_state_with_interruptions(agent, [approval_item])
     processed_response = ProcessedResponse(
         new_items=[],
         handoffs=[],
-        functions=[],
+        functions=[
+            ToolRunFunction(
+                tool_call=queued_call,
+                function_tool=deferred_lookup_account,
+            )
+        ],
         computer_actions=[],
         local_shell_calls=[],
         shell_calls=[],
@@ -1202,6 +1216,7 @@ async def test_resume_rebuilds_deferred_function_runs_from_lookup_key_without_ra
         if isinstance(item, ToolCallOutputItem) and item.output == "deferred:customer_1"
     ]
     assert deferred_outputs == ["deferred:customer_1"]
+    assert calls == ["deferred"]
 
 
 @pytest.mark.asyncio
