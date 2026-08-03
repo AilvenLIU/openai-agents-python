@@ -33,6 +33,7 @@ from .memory import Session
 from .result import RunResult, RunResultStreaming
 from .run_config import (
     DEFAULT_MAX_TURNS,
+    AgentToolNameCollisionPolicy as AgentToolNameCollisionPolicy,
     CallModelData,
     CallModelInputFilter,
     ModelInputData,
@@ -143,6 +144,7 @@ __all__ = [
     "ModelInputData",
     "CallModelData",
     "CallModelInputFilter",
+    "AgentToolNameCollisionPolicy",
     "ReasoningItemIdPolicy",
     "ToolExecutionConfig",
     "ToolErrorFormatter",

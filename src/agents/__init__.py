@@ -109,6 +109,7 @@ from .retry import (
     retry_policies,
 )
 from .run import (
+    AgentToolNameCollisionPolicy,
     ReasoningItemIdPolicy,
     RunConfig,
     Runner,
@@ -476,6 +477,7 @@ __all__ = [
     "RunResultStreaming",
     "ResponsesWebSocketSession",
     "RunConfig",
+    "AgentToolNameCollisionPolicy",
     "ReasoningItemIdPolicy",
     "ToolExecutionConfig",
     "ToolErrorFormatter",

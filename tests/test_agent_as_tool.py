@@ -34,8 +34,10 @@ from agents import (
     ToolCallOutputItem,
     TResponseInputItem,
     Usage,
+    UserError,
     tool_namespace,
 )
+from agents._tool_identity import validate_agent_tool_name_collisions
 from agents.agent_tool_input import StructuredToolInputBuilderOptions
 from agents.agent_tool_state import (
     get_agent_tool_state_scope,
@@ -54,6 +56,116 @@ from tests.utils.hitl import make_function_tool_call
 
 class BoolCtx(BaseModel):
     enable_tools: bool
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_rejects_colliding_derived_names():
+    refund = Agent(name="Refund")
+    normalized_refund = Agent(name="refund")
+    orchestrator = Agent(
+        name="orchestrator",
+        tools=[
+            refund.as_tool(tool_name=None, tool_description="First refund agent"),
+            normalized_refund.as_tool(tool_name=None, tool_description="Second refund agent"),
+        ],
+    )
+
+    tools = await orchestrator.get_all_tools(RunContextWrapper(None))
+    with pytest.raises(UserError) as exc_info:
+        validate_agent_tool_name_collisions(tools, collision_policy="error")
+
+    assert str(exc_info.value) == (
+        "Ambiguous agent tool configuration: agents 'Refund' and 'refund' both derive the tool "
+        "name `refund`. Pass an explicit `tool_name=` to one of them."
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_derived_name_collision_allows_explicit_override():
+    refund = Agent(name="Refund")
+    normalized_refund = Agent(name="refund")
+    orchestrator = Agent(
+        name="orchestrator",
+        tools=[
+            refund.as_tool(tool_name=None, tool_description="First refund agent"),
+            normalized_refund.as_tool(
+                tool_name="normalized_refund",
+                tool_description="Second refund agent",
+            ),
+        ],
+    )
+
+    tools = await orchestrator.get_all_tools(RunContextWrapper(None))
+
+    assert [tool.name for tool in tools] == ["refund", "normalized_refund"]
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_ignores_disabled_derived_name_collision():
+    refund = Agent(name="Refund")
+    normalized_refund = Agent(name="refund")
+    orchestrator = Agent(
+        name="orchestrator",
+        tools=[
+            refund.as_tool(tool_name=None, tool_description="First refund agent"),
+            normalized_refund.as_tool(
+                tool_name=None,
+                tool_description="Second refund agent",
+                is_enabled=False,
+            ),
+        ],
+    )
+
+    tools = await orchestrator.get_all_tools(RunContextWrapper(None))
+
+    assert [tool.name for tool in tools] == ["refund"]
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_default_identity_tracks_the_current_tool_name():
+    refund = Agent(name="Refund")
+    derived_tool = refund.as_tool(tool_name=None, tool_description="Refund agent")
+    copied_tool = dataclasses.replace(derived_tool)
+    renamed_tool = dataclasses.replace(derived_tool, name="renamed_refund")
+    normalized_refund = Agent(name="refund")
+    colliding_tool = normalized_refund.as_tool(
+        tool_name=None,
+        tool_description="Normalized refund agent",
+    )
+
+    copied_orchestrator = Agent(name="copied", tools=[copied_tool, colliding_tool])
+    copied_tools = await copied_orchestrator.get_all_tools(RunContextWrapper(None))
+    with pytest.raises(UserError, match="Ambiguous agent tool configuration"):
+        validate_agent_tool_name_collisions(copied_tools, collision_policy="error")
+
+    renamed_orchestrator = Agent(name="renamed", tools=[renamed_tool, colliding_tool])
+    tools = await renamed_orchestrator.get_all_tools(RunContextWrapper(None))
+    validate_agent_tool_name_collisions(tools, collision_policy="error")
+    assert [tool.name for tool in tools] == ["renamed_refund", "refund"]
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_derived_names_are_disambiguated_by_namespace():
+    refund = Agent(name="Refund").as_tool(tool_name=None, tool_description="Sales refunds")
+    normalized_refund = Agent(name="refund").as_tool(
+        tool_name=None,
+        tool_description="Support refunds",
+    )
+    sales_refund = tool_namespace(name="sales", description="Sales", tools=[refund])[0]
+    support_refund = tool_namespace(
+        name="support",
+        description="Support",
+        tools=[normalized_refund],
+    )[0]
+    orchestrator = Agent(name="orchestrator", tools=[sales_refund, support_refund])
+
+    tools = await orchestrator.get_all_tools(RunContextWrapper(None))
+
+    assert all(isinstance(tool, FunctionTool) for tool in tools)
+    assert [cast(FunctionTool, tool).qualified_name for tool in tools] == [
+        "sales.refund",
+        "support.refund",
+    ]
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,7 @@ from typing_extensions import TypedDict
 import agents._debug as _debug
 from agents import (
     Agent,
+    AgentToolNameCollisionPolicy,
     GuardrailFunctionOutput,
     Handoff,
     HandoffInputData,
@@ -166,6 +167,106 @@ async def _run_agent_with_optional_streaming(
             pass
         return result
     return await Runner.run(agent, input=input, **kwargs)
+
+
+@pytest.mark.parametrize("surface", ["agent_tool", "handoff", "mixed"])
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("collision_policy", ["warn", "error"])
+@pytest.mark.asyncio
+async def test_run_reports_derived_agent_name_collisions_before_model_call(
+    surface: str,
+    streamed: bool,
+    collision_policy: AgentToolNameCollisionPolicy,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    model = FakeModel(initial_output=[get_text_message("done")])
+    billing = Agent(name="Billing Agent")
+    normalized_billing = Agent(name="billing agent")
+    if surface == "agent_tool":
+        agent = Agent(
+            name="triage",
+            model=model,
+            tools=[
+                billing.as_tool(tool_name=None, tool_description="First billing agent"),
+                normalized_billing.as_tool(
+                    tool_name=None,
+                    tool_description="Second billing agent",
+                ),
+            ],
+        )
+    elif surface == "handoff":
+        agent = Agent(
+            name="triage",
+            model=model,
+            handoffs=[billing, normalized_billing],
+        )
+    else:
+        agent = Agent(
+            name="triage",
+            model=model,
+            tools=[
+                Agent(name="transfer to Billing Agent").as_tool(
+                    tool_name=None,
+                    tool_description="Billing tool",
+                )
+            ],
+            handoffs=[billing],
+        )
+
+    run_config = RunConfig(agent_tool_name_collision_policy=collision_policy)
+    if collision_policy == "error":
+        with pytest.raises(
+            UserError,
+            match="Ambiguous (agent tool|handoff|agent routing) configuration",
+        ):
+            await _run_agent_with_optional_streaming(
+                agent,
+                input="Route this request",
+                streamed=streamed,
+                run_config=run_config,
+            )
+
+        assert model.first_turn_args is None
+        assert not model.last_turn_args
+    else:
+        with caplog.at_level("WARNING", logger="openai.agents"):
+            await _run_agent_with_optional_streaming(
+                agent,
+                input="Route this request",
+                streamed=streamed,
+                run_config=run_config,
+            )
+
+        assert model.first_turn_args is not None
+        collision_messages = [
+            message for message in caplog.messages if message.startswith("Ambiguous ")
+        ]
+        assert len(collision_messages) == 1
+        assert "Pass an explicit" in collision_messages[0]
+
+
+@pytest.mark.asyncio
+async def test_run_warns_once_for_repeated_source_agent_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    model = FakeModel(initial_output=[get_text_message("done")])
+    agent = Agent(
+        name="orchestrator",
+        model=model,
+        tools=[
+            Agent(name="Refund").as_tool(tool_name=None, tool_description="First refund agent"),
+            Agent(name="refund").as_tool(tool_name=None, tool_description="Second refund agent"),
+            Agent(name="refund").as_tool(tool_name=None, tool_description="Third refund agent"),
+        ],
+    )
+
+    with caplog.at_level("WARNING", logger="openai.agents"):
+        await Runner.run(agent, "Route this request")
+
+    collision_messages = [
+        message for message in caplog.messages if message.startswith("Ambiguous ")
+    ]
+    assert len(collision_messages) == 1
 
 
 def test_set_default_agent_runner_roundtrip():

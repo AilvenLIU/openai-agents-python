@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import inspect
 import json
 import logging
@@ -18,6 +19,7 @@ from agents import (
     UserError,
     handoff,
 )
+from agents._tool_identity import validate_agent_tool_name_collisions
 from agents.run_internal.run_loop import get_handoffs
 
 
@@ -81,6 +83,82 @@ async def test_multiple_handoffs_setup():
 
     assert handoff_objects[0].agent_name == agent_1.name
     assert handoff_objects[1].agent_name == agent_2.name
+
+
+@pytest.mark.asyncio
+async def test_handoffs_reject_colliding_derived_names():
+    billing = Agent(name="Billing Agent")
+    normalized_billing = Agent(name="billing agent")
+    triage = Agent(name="triage", handoffs=[billing, normalized_billing])
+
+    handoffs = await get_handoffs(triage, RunContextWrapper(None))
+    with pytest.raises(UserError) as exc_info:
+        validate_agent_tool_name_collisions((), handoffs, collision_policy="error")
+
+    assert str(exc_info.value) == (
+        "Ambiguous handoff configuration: agents 'Billing Agent' and 'billing agent' both derive "
+        "the handoff tool name `transfer_to_billing_agent`. Pass an explicit "
+        "`tool_name_override=` to one of them."
+    )
+
+
+@pytest.mark.asyncio
+async def test_handoff_derived_name_collision_allows_explicit_override():
+    billing = Agent(name="Billing Agent")
+    normalized_billing = Agent(name="billing agent")
+    triage = Agent(
+        name="triage",
+        handoffs=[
+            billing,
+            handoff(normalized_billing, tool_name_override="transfer_to_normalized_billing"),
+        ],
+    )
+
+    handoffs = await get_handoffs(triage, RunContextWrapper(None))
+
+    assert [item.tool_name for item in handoffs] == [
+        "transfer_to_billing_agent",
+        "transfer_to_normalized_billing",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handoffs_ignore_disabled_derived_name_collision():
+    billing = Agent(name="Billing Agent")
+    normalized_billing = Agent(name="billing agent")
+    triage = Agent(
+        name="triage",
+        handoffs=[billing, handoff(normalized_billing, is_enabled=False)],
+    )
+
+    handoffs = await get_handoffs(triage, RunContextWrapper(None))
+
+    assert [item.agent_name for item in handoffs] == ["Billing Agent"]
+
+
+@pytest.mark.asyncio
+async def test_handoff_default_identity_tracks_the_current_tool_name():
+    billing = Agent(name="Billing Agent")
+    derived_handoff = handoff(billing)
+    copied_handoff = dataclasses.replace(derived_handoff)
+    renamed_handoff = dataclasses.replace(
+        derived_handoff,
+        tool_name="transfer_to_primary_billing",
+    )
+    normalized_billing = Agent(name="billing agent")
+
+    copied_triage = Agent(name="copied", handoffs=[copied_handoff, normalized_billing])
+    copied_handoffs = await get_handoffs(copied_triage, RunContextWrapper(None))
+    with pytest.raises(UserError, match="Ambiguous handoff configuration"):
+        validate_agent_tool_name_collisions((), copied_handoffs, collision_policy="error")
+
+    renamed_triage = Agent(name="renamed", handoffs=[renamed_handoff, normalized_billing])
+    handoffs = await get_handoffs(renamed_triage, RunContextWrapper(None))
+    validate_agent_tool_name_collisions((), handoffs, collision_policy="error")
+    assert [item.tool_name for item in handoffs] == [
+        "transfer_to_primary_billing",
+        "transfer_to_billing_agent",
+    ]
 
 
 def test_default_handoff_tool_name_allows_whitespace_without_warning(

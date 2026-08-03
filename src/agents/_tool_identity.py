@@ -6,6 +6,7 @@ from typing import Any, Literal, cast
 from typing_extensions import Required, TypedDict
 
 from .exceptions import UserError
+from .logger import logger
 
 BareFunctionToolLookupKey = tuple[Literal["bare"], str]
 NamespacedFunctionToolLookupKey = tuple[Literal["namespaced"], str, str]
@@ -318,6 +319,97 @@ def validate_function_tool_namespace_shape(
         f"`{reserved_key}` for deferred top-level function tools. "
         "Rename the namespace or tool name to avoid ambiguous dispatch."
     )
+
+
+def validate_agent_tool_name_collisions(
+    tools: Sequence[Any],
+    handoffs: Sequence[Any] = (),
+    *,
+    collision_policy: Literal["warn", "error"],
+) -> None:
+    """Report colliding canonical names derived from distinct agents."""
+    derived_name_owners: dict[FunctionToolLookupKey, dict[str, str]] = {}
+
+    def add_owner(
+        lookup_key: FunctionToolLookupKey,
+        agent_name: str,
+        override_parameter: str,
+    ) -> None:
+        owners = derived_name_owners.setdefault(lookup_key, {})
+        owners.setdefault(agent_name, override_parameter)
+
+    for tool in tools:
+        default_identity = getattr(tool, "_agent_tool_default_identity", None)
+        if not (
+            isinstance(default_identity, tuple)
+            and len(default_identity) == 2
+            and all(isinstance(value, str) for value in default_identity)
+        ):
+            continue
+
+        tool_name = get_function_tool_public_name(tool)
+        agent_name, derived_tool_name = default_identity
+        if tool_name != derived_tool_name:
+            continue
+
+        lookup_key = get_function_tool_lookup_key_for_tool(tool)
+        if lookup_key is None:
+            continue
+        add_owner(lookup_key, agent_name, "tool_name")
+
+    for handoff in handoffs:
+        default_identity = getattr(handoff, "_default_tool_identity", None)
+        if not (
+            isinstance(default_identity, tuple)
+            and len(default_identity) == 2
+            and all(isinstance(value, str) for value in default_identity)
+        ):
+            continue
+
+        agent_name, derived_tool_name = default_identity
+        tool_name = getattr(handoff, "tool_name", None)
+        if tool_name != derived_tool_name:
+            continue
+        add_owner(("bare", derived_tool_name), agent_name, "tool_name_override")
+
+    for lookup_key, owners_by_agent_name in derived_name_owners.items():
+        if len(owners_by_agent_name) < 2:
+            continue
+
+        (
+            (prior_agent_name, prior_override_parameter),
+            (
+                agent_name,
+                override_parameter,
+            ),
+        ) = list(owners_by_agent_name.items())[:2]
+
+        if lookup_key[0] == "namespaced":
+            derived_name = f"{lookup_key[1]}.{lookup_key[2]}"
+        else:
+            derived_name = lookup_key[1]
+
+        if override_parameter == prior_override_parameter == "tool_name":
+            configuration_type = "agent tool"
+            name_label = "tool name"
+            override_instruction = "`tool_name=`"
+        elif override_parameter == prior_override_parameter == "tool_name_override":
+            configuration_type = "handoff"
+            name_label = "handoff tool name"
+            override_instruction = "`tool_name_override=`"
+        else:
+            configuration_type = "agent routing"
+            name_label = "tool name"
+            override_instruction = "`tool_name=` or `tool_name_override=`"
+
+        message = (
+            f"Ambiguous {configuration_type} configuration: agents "
+            f"{prior_agent_name!r} and {agent_name!r} both derive the {name_label} "
+            f"`{derived_name}`. Pass an explicit {override_instruction} to one of them."
+        )
+        if collision_policy == "error":
+            raise UserError(message)
+        logger.warning("%s", message)
 
 
 def validate_function_tool_lookup_configuration(tools: Sequence[Any]) -> None:

@@ -28,6 +28,7 @@ from .._tool_identity import (
     build_function_tool_lookup_map,
     get_function_tool_lookup_key_for_call,
     get_tool_trace_name_for_tool,
+    validate_agent_tool_name_collisions,
 )
 from ..agent import Agent
 from ..agent_output import AgentOutputSchemaBase
@@ -1508,6 +1509,11 @@ async def run_single_turn_streamed(
     )
 
     handoffs = await get_handoffs(execution_agent, context_wrapper)
+    validate_agent_tool_name_collisions(
+        all_tools,
+        handoffs,
+        collision_policy=run_config.agent_tool_name_collision_policy,
+    )
     model = get_model(execution_agent, run_config)
     tool_use_tracker.record_model(model)
     model_settings = get_model_settings(execution_agent, run_config)
@@ -1977,6 +1983,11 @@ async def get_new_response(
     prompt_cache_key_resolver: PromptCacheKeyResolver | None = None,
 ) -> ModelResponse:
     """Call the model and return the raw response, handling retries and hooks."""
+    validate_agent_tool_name_collisions(
+        all_tools,
+        handoffs,
+        collision_policy=run_config.agent_tool_name_collision_policy,
+    )
     public_agent = bindings.public_agent
     execution_agent = bindings.execution_agent
     filtered = await maybe_filter_model_input(
