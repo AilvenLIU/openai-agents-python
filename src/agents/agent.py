@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
 import inspect
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, cast
 
@@ -91,6 +92,11 @@ ToolsToFinalOutputFunction: TypeAlias = Callable[
 """A function that takes a run context and a list of tool results, and returns a
 `ToolsToFinalOutputResult`.
 """
+
+
+_current_mcp_handoff_snapshot: contextvars.ContextVar[
+    tuple[object, tuple[Handoff[Any, Any], ...]] | None
+] = contextvars.ContextVar("current_mcp_handoff_snapshot", default=None)
 
 
 def _validate_codex_tool_name_collisions(tools: list[Tool]) -> None:
@@ -225,7 +231,7 @@ class AgentBase(Generic[TContext]):
     async def _get_mcp_tools_with_handoffs_snapshot(
         self,
         run_context: RunContextWrapper[TContext],
-        enabled_handoffs: list[Handoff[Any, Any]] | None,
+        enabled_handoffs: Sequence[Handoff[Any, Any]] | None,
     ) -> list[Tool]:
         """Fetch MCP tools using an optional pre-resolved handoff snapshot."""
         convert_schemas_to_strict = self.mcp_config.get("convert_schemas_to_strict", False)
@@ -254,7 +260,13 @@ class AgentBase(Generic[TContext]):
 
     async def get_mcp_tools(self, run_context: RunContextWrapper[TContext]) -> list[Tool]:
         """Fetches the available tools from the MCP servers."""
-        return await self._get_mcp_tools_with_handoffs_snapshot(run_context, None)
+        current_snapshot = _current_mcp_handoff_snapshot.get()
+        enabled_handoffs = (
+            current_snapshot[1]
+            if current_snapshot is not None and current_snapshot[0] is self
+            else None
+        )
+        return await self._get_mcp_tools_with_handoffs_snapshot(run_context, enabled_handoffs)
 
     def _uses_custom_get_mcp_tools(self) -> bool:
         """Return whether tool collection uses a public method override."""
@@ -267,11 +279,17 @@ class AgentBase(Generic[TContext]):
     async def _get_all_tools_with_handoffs_snapshot(
         self,
         run_context: RunContextWrapper[TContext],
-        enabled_handoffs: list[Handoff[Any, Any]] | None,
+        enabled_handoffs: Sequence[Handoff[Any, Any]] | None,
     ) -> list[Tool]:
         """Resolve all tools using an optional pre-resolved handoff snapshot."""
-        if enabled_handoffs is None or self._uses_custom_get_mcp_tools():
+        if enabled_handoffs is None:
             mcp_tools = await self.get_mcp_tools(run_context)
+        elif self._uses_custom_get_mcp_tools():
+            snapshot_token = _current_mcp_handoff_snapshot.set((self, tuple(enabled_handoffs)))
+            try:
+                mcp_tools = await self.get_mcp_tools(run_context)
+            finally:
+                _current_mcp_handoff_snapshot.reset(snapshot_token)
         else:
             mcp_tools = await self._get_mcp_tools_with_handoffs_snapshot(
                 run_context,

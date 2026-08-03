@@ -198,6 +198,31 @@ def is_handoff_tool_call(output: Any, handoff_tool_names: Container[str]) -> boo
     return get_tool_call_qualified_name(output) == output.name and output.name in handoff_tool_names
 
 
+def _order_function_items_by_model_call(
+    items: Sequence[RunItem],
+    model_output: Sequence[Any],
+) -> list[RunItem]:
+    """Order function result items by their corresponding model call positions."""
+    call_positions: dict[str, int] = {}
+    for index, output_item in enumerate(model_output):
+        call_id = extract_tool_call_id(output_item)
+        if call_id is not None:
+            call_positions.setdefault(call_id, index)
+
+    def _item_order(entry: tuple[int, RunItem]) -> tuple[int, int]:
+        original_index, item = entry
+        call_id = extract_tool_call_id(getattr(item, "raw_item", None))
+        call_position = call_positions.get(call_id) if call_id is not None else None
+        return (
+            call_position if call_position is not None else len(model_output) + original_index,
+            original_index,
+        )
+
+    indexed_items = list(enumerate(items))
+    indexed_items.sort(key=_item_order)
+    return [item for _, item in indexed_items]
+
+
 async def _maybe_finalize_from_tool_results(
     *,
     public_agent: Agent[TContext],
@@ -1755,22 +1780,33 @@ async def resolve_interrupted_turn(
 
     new_items, append_if_new = _make_unique_item_appender(original_pre_step_items)
 
-    for item in _build_tool_result_items(
+    function_result_items = _build_tool_result_items(
         function_results=function_results,
-        computer_results=computer_results,
-        custom_tool_results=custom_tool_results,
-        shell_results=shell_results,
-        apply_patch_results=apply_patch_results,
+        computer_results=[],
+        custom_tool_results=[],
+        shell_results=[],
+        apply_patch_results=[],
         local_shell_results=[],
-    ):
-        append_if_new(item)
+    )
     missing_tool_output_items = await _build_tool_not_found_output_items(
         agent=public_agent,
         calls=missing_queued_function_tools,
         context_wrapper=context_wrapper,
         run_config=run_config,
     )
-    for item in missing_tool_output_items:
+    for item in _order_function_items_by_model_call(
+        [*function_result_items, *missing_tool_output_items],
+        new_response.output,
+    ):
+        append_if_new(item)
+    for item in _build_tool_result_items(
+        function_results=[],
+        computer_results=computer_results,
+        custom_tool_results=custom_tool_results,
+        shell_results=shell_results,
+        apply_patch_results=apply_patch_results,
+        local_shell_results=[],
+    ):
         append_if_new(item)
     for missing_call in missing_queued_function_tools:
         drop_agent_tool_run_result(missing_call.tool_call, scope_id=tool_state_scope_id)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 from openai.types.responses import ResponseFunctionToolCall
 from openai.types.responses.response_function_tool_call import CallerProgram
@@ -18,6 +20,7 @@ from agents import (
     handoff,
 )
 from agents.agent import AgentBase
+from agents.items import ToolCallOutputItem
 from agents.tool import Tool, function_tool
 
 from .fake_model import FakeModel
@@ -713,6 +716,68 @@ async def test_resume_returns_missing_current_function_error_to_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resume_preserves_model_order_for_missing_and_executed_functions() -> None:
+    calls: list[str] = []
+
+    def missing_lookup() -> str:
+        calls.append("missing")
+        return "missing"
+
+    def available_lookup() -> str:
+        calls.append("available")
+        return "available"
+
+    missing_tool = function_tool(
+        missing_lookup,
+        name_override="missing_lookup",
+        needs_approval=True,
+    )
+    available_tool = function_tool(
+        available_lookup,
+        name_override="available_lookup",
+        needs_approval=True,
+    )
+    model = FakeModel(
+        initial_output=[
+            get_function_tool_call("missing_lookup", "{}", call_id="missing_call"),
+            get_function_tool_call("available_lookup", "{}", call_id="available_call"),
+        ]
+    )
+    agent = Agent(name="agent", model=model, tools=[missing_tool, available_tool])
+
+    initial_result = await Runner.run(agent, "Look these up")
+    state = await RunState.from_json(agent, initial_result.to_state().to_json())
+    for interruption in state.get_interruptions():
+        state.approve(interruption)
+    agent.tools = [available_tool]
+    model.set_next_output([get_text_message("done")])
+
+    resumed_result = await Runner.run(
+        agent,
+        state,
+        run_config=RunConfig(tool_not_found_behavior="return_error_to_model"),
+    )
+
+    assert resumed_result.final_output == "done"
+    assert calls == ["available"]
+    emitted_function_output_call_ids = [
+        cast(dict[str, Any], item.raw_item)["call_id"]
+        for item in resumed_result.new_items
+        if isinstance(item, ToolCallOutputItem)
+        and isinstance(item.raw_item, dict)
+        and item.raw_item.get("type") == "function_call_output"
+    ]
+    assert emitted_function_output_call_ids == ["missing_call", "available_call"]
+    assert isinstance(model.last_turn_args["input"], list)
+    function_output_call_ids = [
+        item["call_id"]
+        for item in model.last_turn_args["input"]
+        if item.get("type") == "function_call_output"
+    ]
+    assert function_output_call_ids == ["missing_call", "available_call"]
+
+
+@pytest.mark.asyncio
 async def test_resume_ignores_completed_function_after_tool_removal() -> None:
     calls: list[str] = []
 
@@ -1068,13 +1133,21 @@ async def test_resume_reuses_handoff_enablement_snapshot_for_mcp_names() -> None
         on_handoff=record_handoff,
         is_enabled=handoff_enabled,
     )
+
+    class DelegatingMCPAgent(Agent[None]):
+        async def get_mcp_tools(
+            self,
+            run_context: RunContextWrapper[None],
+        ) -> list[Tool]:
+            return await super().get_mcp_tools(run_context)
+
     model = FakeModel(
         initial_output=[
             get_function_tool_call("approval_tool", "{}", call_id="approval_call"),
             get_handoff_tool_call(target, override_name="route", args="{}"),
         ]
     )
-    agent = Agent(
+    agent = DelegatingMCPAgent(
         name="agent",
         model=model,
         tools=[approval_tool],
