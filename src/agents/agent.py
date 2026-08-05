@@ -912,38 +912,23 @@ class Agent(AgentBase, Generic[TContext]):
                             if is_sentinel:
                                 break
 
-                    dispatch_task = asyncio.create_task(dispatch_stream_events())
-                    stream_iteration_cancelled = False
-
-                    try:
+                    async def enqueue_stream_events() -> None:
                         from .stream_events import AgentUpdatedStreamEvent
 
                         current_agent = run_result_streaming.current_agent
-                        try:
-                            async for event in run_result_streaming.stream_events():
-                                if isinstance(event, AgentUpdatedStreamEvent):
-                                    current_agent = event.new_agent
+                        async for event in run_result_streaming.stream_events():
+                            if isinstance(event, AgentUpdatedStreamEvent):
+                                current_agent = event.new_agent
 
-                                payload: AgentToolStreamEvent = {
-                                    "event": event,
-                                    "agent": current_agent,
-                                    "tool_call": context.tool_call,
-                                }
-                                await event_queue.put(payload)
-                        except asyncio.CancelledError:
-                            stream_iteration_cancelled = True
-                            raise
-                    finally:
-                        if stream_iteration_cancelled:
-                            dispatch_task.cancel()
-                            try:
-                                await dispatch_task
-                            except asyncio.CancelledError:
-                                pass
-                        else:
-                            await event_queue.put(None)
-                            await event_queue.join()
-                            await dispatch_task
+                            payload: AgentToolStreamEvent = {
+                                "event": event,
+                                "agent": current_agent,
+                                "tool_call": context.tool_call,
+                            }
+                            await event_queue.put(payload)
+                        await event_queue.put(None)
+
+                    await gather_with_cancel(enqueue_stream_events(), dispatch_stream_events())
                     run_result = run_result_streaming
                 else:
                     run_result = await Runner.run(

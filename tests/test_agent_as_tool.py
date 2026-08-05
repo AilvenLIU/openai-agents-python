@@ -3047,3 +3047,72 @@ def test_replaced_agent_as_tool_preserves_agent_markers_for_build_agent_map() ->
     agent_map = _build_agent_map(parent_agent)
 
     assert agent_map["nested_agent"] is nested_agent
+
+
+class _FatalAgentToolStreamHandlerError(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler_error",
+    [_FatalAgentToolStreamHandlerError("fatal"), asyncio.CancelledError()],
+    ids=["base_exception", "cancelled_error"],
+)
+async def test_agent_as_tool_streaming_propagates_base_exception_without_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+    handler_error: BaseException,
+) -> None:
+    agent = Agent(name="streamer")
+    source_cancelled = asyncio.Event()
+    stream_event = RawResponsesStreamEvent(data=cast(Any, {"type": "response_started"}))
+
+    class DummyStreamingResult:
+        def __init__(self) -> None:
+            self.final_output = "streamed"
+            self.current_agent = agent
+
+        async def stream_events(self):
+            yield stream_event
+            try:
+                await asyncio.Event().wait()
+            finally:
+                source_cancelled.set()
+
+    monkeypatch.setattr(
+        Runner,
+        "run_streamed",
+        classmethod(lambda *args, **kwargs: DummyStreamingResult()),
+    )
+
+    async def on_stream(payload: AgentToolStreamEvent) -> None:
+        del payload
+        raise handler_error
+
+    tool_call = ResponseFunctionToolCall(
+        id="call_fatal",
+        arguments='{"input": "go"}',
+        call_id="call-fatal",
+        name="stream_tool",
+        type="function_call",
+    )
+    tool = agent.as_tool(
+        tool_name="stream_tool",
+        tool_description="Streams events",
+        on_stream=on_stream,
+    )
+    tool_context = ToolContext(
+        context=None,
+        tool_name="stream_tool",
+        tool_call_id=tool_call.call_id,
+        tool_arguments=tool_call.arguments,
+        tool_call=tool_call,
+    )
+
+    with pytest.raises(type(handler_error)):
+        await asyncio.wait_for(
+            tool.on_invoke_tool(tool_context, '{"input": "go"}'),
+            timeout=1.0,
+        )
+
+    assert source_cancelled.is_set()
