@@ -999,6 +999,7 @@ class Agent(AgentBase, Generic[TContext]):
                         run_result,
                         scope_id=tool_state_scope_id,
                     )
+                return run_result.final_output
 
             if custom_output_extractor is not None:
                 return await custom_output_extractor(run_result)

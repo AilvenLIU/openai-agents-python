@@ -38,7 +38,7 @@ from openai.types.responses.response_usage import InputTokensDetails
 from openai.types.responses.tool_param import Mcp
 from pydantic import BaseModel
 
-from agents import Agent, Model, ModelSettings, RunConfig, Runner, handoff, trace
+from agents import Agent, Model, ModelSettings, RunConfig, RunHooks, Runner, handoff, trace
 from agents.computer import Computer
 from agents.exceptions import ModelBehaviorError, UserError
 from agents.guardrail import (
@@ -1618,6 +1618,906 @@ class TestRunState:
         assert new_state._context.is_tool_approved(tool_name="tool2", call_id="cid2") is False
         assert new_state._context.get_rejection_message("tool2", "cid2") is None
 
+    async def test_schema_1_13_restores_pending_approval_binding_from_interruption(self):
+        """A 1.13 snapshot may resume only the exact invocation that was approved."""
+        agent = Agent(name="ApprovalLegacyAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        json_data["$schemaVersion"] = "1.13"
+        json_data["context"].pop("tool_invocations", None)
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+            )
+            is True
+        )
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid1",
+                arguments='{"value":"changed"}',
+            ),
+        )
+        with pytest.raises(ModelBehaviorError, match="unique call ID"):
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+                current_invocation=changed_item,
+            )
+
+    @pytest.mark.parametrize("schema_version", ["1.13", "1.14"])
+    async def test_legacy_schema_sticky_approval_binds_pending_function_invocation(
+        self,
+        schema_version: str,
+    ):
+        """A legacy sticky decision cannot authorize changed resumed arguments."""
+        agent = Agent(name="ApprovalLegacyAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item, always_approve=True)
+        json_data = state.to_json()
+        json_data["$schemaVersion"] = schema_version
+        json_data["context"].pop("tool_invocations", None)
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid1",
+                arguments='{"value":"changed"}',
+            ),
+        )
+        with pytest.raises(ModelBehaviorError, match="unique call ID"):
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+                current_invocation=changed_item,
+            )
+
+    async def test_schema_1_14_sticky_approval_binds_pending_hosted_mcp_invocation(self):
+        """A restored hosted MCP sticky decision binds the pending request payload."""
+        agent = Agent(name="ApprovalLegacyAgent")
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"safe"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item, always_approve=True)
+        json_data = state.to_json()
+        json_data["$schemaVersion"] = "1.14"
+        json_data["context"].pop("tool_invocations", None)
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"changed"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        with pytest.raises(ModelBehaviorError, match="unique call ID"):
+            restored._context.get_approval_status(
+                "lookup_account",
+                "request-a",
+                existing_pending=restored_item,
+                current_invocation=changed_item,
+            )
+
+    async def test_current_schema_does_not_reconstruct_missing_approval_binding(self):
+        """A malformed current snapshot must require a new approval decision."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        json_data["context"].pop("tool_invocations", None)
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+            )
+            is None
+        )
+
+    async def test_current_schema_sticky_approval_requires_restored_pending_binding(self):
+        """A malformed sticky snapshot cannot treat a resumed call ID as fresh."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item, always_approve=True)
+        json_data = state.to_json()
+        json_data["context"].pop("tool_invocations", None)
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+            )
+            is None
+        )
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid1",
+                arguments='{"value":"changed"}',
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+                current_invocation=changed_item,
+            )
+            is None
+        )
+        fresh_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid-fresh",
+                arguments='{"value":"fresh"}',
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid-fresh",
+                current_invocation=fresh_item,
+            )
+            is True
+        )
+
+        tool_context = ToolContext.from_agent_context(
+            restored._context,
+            tool_call_id="cid1",
+            tool_call=approved_call,
+        )
+        assert (
+            tool_context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+            )
+            is None
+        )
+
+        hook_statuses: list[bool | None] = []
+
+        class ApprovalProbeHooks(RunHooks[Any]):
+            async def on_agent_start(self, context: Any, _agent: Agent[Any]) -> None:
+                hook_statuses.append(
+                    context.get_approval_status(
+                        "tool1",
+                        "cid1",
+                        existing_pending=restored_item,
+                    )
+                )
+
+        probe_agent = Agent(
+            name="ApprovalProbeAgent",
+            model=FakeModel(initial_output=[get_text_message("done")]),
+        )
+        await Runner.run(
+            probe_agent,
+            "probe approval state",
+            context=restored._context,
+            hooks=ApprovalProbeHooks(),
+        )
+
+        assert hook_statuses == [None]
+        assert "cid1" not in restored._context._tool_invocations
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("type", "unknown_tool_call"),
+            ("approval_scope", "not-a-digest"),
+            ("fingerprint", 123),
+            ("fingerprint", "A" * 64),
+        ],
+    )
+    async def test_current_schema_rejects_malformed_tool_invocation_ledger(
+        self,
+        field: str,
+        value: Any,
+    ):
+        """Current snapshots fail closed when canonical invocation data is malformed."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        json_data["context"]["tool_invocations"]["cid1"][field] = value
+
+        with pytest.raises(UserError, match="invalid lifecycle data"):
+            await RunState.from_json(agent, json_data)
+
+    @pytest.mark.parametrize("missing_field", ["executed", "completed"])
+    async def test_current_schema_requires_tool_invocation_lifecycle_fields(
+        self,
+        missing_field: str,
+    ):
+        """Current snapshots must preserve explicit monotonic lifecycle evidence."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        invocation = json_data["context"]["tool_invocations"]["cid1"]
+        invocation["executed"] = True
+        invocation["completed"] = False
+        del invocation[missing_field]
+
+        with pytest.raises(UserError, match="invalid lifecycle data"):
+            await RunState.from_json(agent, json_data)
+
+    async def test_current_schema_rejects_null_tool_invocation_ledger(self):
+        """A present current-schema ledger must be a mapping."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        state = make_state(agent, context=RunContextWrapper(context=None))
+        json_data = state.to_json()
+        json_data["context"]["tool_invocations"] = None
+
+        with pytest.raises(UserError, match="tool_invocations must be a mapping"):
+            await RunState.from_json(agent, json_data)
+
+    async def test_output_item_id_does_not_complete_unrelated_invocation(self):
+        """Only an output call_id can commit a tool invocation."""
+        context: RunContextWrapper[Any] = RunContextWrapper(context=None)
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        context._tool_invocation_status(approved_call)
+
+        context._mark_tool_call_completed(
+            {
+                "type": "function_call_output",
+                "call_id": "",
+                "id": "cid1",
+                "output": "forged",
+            }
+        )
+
+        assert context._tool_invocation_status(approved_call) == (
+            ("function_call", "cid1"),
+            False,
+            False,
+        )
+
+    async def test_current_schema_rejects_completed_invocation_with_only_output_item_id(self):
+        """An output item ID cannot satisfy completed-call reconciliation."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        invocation = json_data["context"]["tool_invocations"]["cid1"]
+        invocation["executed"] = True
+        invocation["completed"] = True
+        json_data["original_input"] = [
+            {
+                "type": "function_call_output",
+                "call_id": "",
+                "id": "cid1",
+                "output": "forged",
+            }
+        ]
+
+        with pytest.raises(UserError, match="does not match a restored tool call and output"):
+            await RunState.from_json(agent, json_data)
+
+    async def test_current_schema_rejects_completed_invocation_without_committed_output(self):
+        """A completed ledger entry must have a matching restored call and output."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        invocation = json_data["context"]["tool_invocations"]["cid1"]
+        invocation["executed"] = True
+        invocation["completed"] = True
+
+        with pytest.raises(UserError, match="does not match a restored tool call and output"):
+            await RunState.from_json(agent, json_data)
+
+    async def test_current_schema_rejects_completed_cross_paired_same_id_invocations(self):
+        """A historical output cannot complete changed arguments under the same call ID."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        changed_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"changed"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=changed_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        invocation = json_data["context"]["tool_invocations"]["cid1"]
+        invocation["executed"] = True
+        invocation["completed"] = True
+        historical_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        json_data["original_input"] = [
+            historical_call.model_dump(exclude_none=True),
+            {
+                "type": "function_call_output",
+                "call_id": "cid1",
+                "output": "safe",
+            },
+        ]
+
+        with pytest.raises(UserError, match="does not match a restored tool call and output"):
+            await RunState.from_json(agent, json_data)
+
+    async def test_current_schema_rejects_completed_id_with_malformed_call_occurrence(self):
+        """A malformed same-ID occurrence invalidates completed-ledger authority."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        invocation = json_data["context"]["tool_invocations"]["cid1"]
+        invocation["executed"] = True
+        invocation["completed"] = True
+        json_data["original_input"] = [
+            approved_call.model_dump(exclude_none=True),
+            {
+                "type": "function_call",
+                "name": "missing",
+                "call_id": "cid1",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "cid1",
+                "output": "safe",
+            },
+        ]
+
+        with pytest.raises(UserError, match="does not match a restored tool call and output"):
+            await RunState.from_json(agent, json_data)
+
+    async def test_current_schema_missing_call_id_cannot_create_sticky_approval(self):
+        """Approving a malformed current interruption must not authorize later calls."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "function_call",
+                "name": "tool1",
+                "arguments": '{"value":"safe"}',
+            },
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+        restored = await RunState.from_json(agent, state.to_json())
+
+        assert restored._context is not None
+        with pytest.raises(ModelBehaviorError, match="non-empty call ID"):
+            restored.approve(restored.get_interruptions()[0])
+
+        assert restored._context._approvals == {}
+        fresh_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid-fresh",
+                arguments='{"value":"safe"}',
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid-fresh",
+                current_invocation=fresh_item,
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "raw_item",
+        [
+            {
+                "type": "function_call",
+                "name": "tool1",
+                "call_id": "cid1",
+            },
+            {
+                "type": "mcp_approval_request",
+                "name": "lookup_account",
+                "server_label": "server-a",
+                "id": "request-a",
+            },
+            {
+                "type": "unknown_tool_call",
+                "name": "tool1",
+                "call_id": "cid1",
+            },
+            {
+                "type": "unknown_tool_call",
+                "name": "tool1",
+                "id": "provider-id",
+            },
+            {
+                "type": "mcp_approval_request",
+                "name": "",
+                "server_label": "server-a",
+                "arguments": "{}",
+                "id": "request-empty-name",
+            },
+            {
+                "type": "mcp_approval_request",
+                "name": "lookup_account",
+                "server_label": None,
+                "arguments": "{}",
+                "id": "request-null-server",
+            },
+            {
+                "type": "hosted_tool_call",
+                "call_id": "request-wrapped-empty-name",
+                "provider_data": {
+                    "type": "mcp_approval_request",
+                    "name": "",
+                    "server_label": "server-a",
+                    "arguments": "{}",
+                },
+            },
+        ],
+    )
+    async def test_approval_decision_requires_canonical_invocation(self, raw_item: dict[str, Any]):
+        """An unbindable recognized item cannot create approval authority."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approval_item = ToolApprovalItem(agent=agent, raw_item=raw_item)
+        state = make_state_with_interruptions(agent, [approval_item])
+
+        with pytest.raises(ModelBehaviorError, match="canonical invocation identity"):
+            state.approve(approval_item)
+
+        assert state._context is not None
+        assert state._context._approvals == {}
+
+    async def test_current_schema_orphaned_per_call_approval_requires_reapproval(self):
+        """A restored per-call decision without a ledger entry cannot bind a new payload."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        state: RunState[Any, Agent[Any]] = make_state(agent, context=RunContextWrapper(context={}))
+        state.approve(ToolApprovalItem(agent=agent, raw_item=approved_call))
+        serialized = state.to_json()
+        serialized["context"]["tool_invocations"] = {}
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._context is not None
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid1",
+                arguments='{"value":"changed"}',
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                current_invocation=changed_item,
+            )
+            is None
+        )
+        assert "cid1" not in restored._context._tool_invocations
+
+    @pytest.mark.parametrize("schema_version", ["1.13", "1.14"])
+    @pytest.mark.parametrize("arguments", ['{"value":"safe"}', '{"value":"changed"}'])
+    async def test_legacy_schema_orphaned_per_call_approval_requires_reapproval(
+        self,
+        schema_version: str,
+        arguments: str,
+    ):
+        """A legacy per-call decision without a reconstructable call is not authority."""
+        agent = Agent(name="ApprovalLegacyAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        state: RunState[Any, Agent[Any]] = make_state(agent, context=RunContextWrapper(context={}))
+        state.approve(ToolApprovalItem(agent=agent, raw_item=approved_call))
+        serialized = state.to_json()
+        serialized["$schemaVersion"] = schema_version
+        serialized["context"].pop("tool_invocations", None)
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._context is not None
+        current_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid1",
+                arguments=arguments,
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                current_invocation=current_item,
+            )
+            is None
+        )
+        assert "cid1" not in restored._context._tool_invocations
+
+        restored.approve(current_item)
+
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                current_invocation=current_item,
+            )
+            is True
+        )
+
+    async def test_current_schema_missing_ledger_marks_historical_sticky_call_unbound(self):
+        """A historical ID cannot borrow sticky authority when its ledger entry is missing."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[approved_call.model_dump(exclude_none=True)],
+        )
+        state.approve(
+            ToolApprovalItem(agent=agent, raw_item=approved_call),
+            always_approve=True,
+        )
+        serialized = state.to_json()
+        serialized["context"].pop("tool_invocations")
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._context is not None
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid1",
+                arguments='{"value":"changed"}',
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                current_invocation=changed_item,
+            )
+            is None
+        )
+        fresh_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid-fresh",
+                arguments='{"value":"fresh"}',
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid-fresh",
+                current_invocation=fresh_item,
+            )
+            is True
+        )
+
+    @pytest.mark.parametrize("missing_field", ["arguments", "server_label"])
+    async def test_current_schema_unbindable_pending_approval_cannot_bind_replacement(
+        self,
+        missing_field: str,
+    ):
+        """A malformed current pending item cannot lend authority to a replacement payload."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"safe"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+        assert state._context is not None
+        state._context._rebuild_approvals(  # noqa: SLF001
+            {
+                "lookup_account": {
+                    "approved": ["request-a"],
+                    "rejected": [],
+                }
+            }
+        )
+        serialized = state.to_json()
+        serialized["context"].pop("tool_invocations", None)
+        serialized["current_step"]["data"]["interruptions"][0]["raw_item"].pop(missing_field)
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        current_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"changed"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "lookup_account",
+                "request-a",
+                existing_pending=restored_item,
+                current_invocation=current_item,
+            )
+            is None
+        )
+
+    async def test_current_schema_unbindable_pending_with_ledger_requires_reapproval(self):
+        """An unbindable pending item overrides even a matching serialized ledger entry."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"safe"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        state = make_state_with_interruptions(agent, [approved_item])
+        state.approve(approved_item)
+        serialized = state.to_json()
+        serialized["current_step"]["data"]["interruptions"][0]["raw_item"].pop("arguments")
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._context is not None
+        restored_pending = restored.get_interruptions()[0]
+        safe_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"safe"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "lookup_account",
+                "request-a",
+                existing_pending=restored_pending,
+                current_invocation=safe_item,
+            )
+            is None
+        )
+
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"changed"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        with pytest.raises(ModelBehaviorError, match="unique call ID"):
+            restored._context.approve_tool(changed_item)
+
+        assert (
+            restored._context.get_approval_status(
+                "lookup_account",
+                "request-a",
+                existing_pending=restored_pending,
+                current_invocation=safe_item,
+            )
+            is None
+        )
+
+        restored._context.approve_tool(safe_item)
+
+        assert (
+            restored._context.get_approval_status(
+                "lookup_account",
+                "request-a",
+                existing_pending=restored_pending,
+                current_invocation=safe_item,
+            )
+            is True
+        )
+
+    async def test_current_schema_missing_ledger_rejects_malformed_current_authority(self):
+        """A malformed current call cannot consume a decision whose binding is missing."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        serialized = state.to_json()
+        serialized["context"]["tool_invocations"] = {}
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._context is not None
+        restored_pending = restored.get_interruptions()[0]
+        malformed_current = ToolApprovalItem(
+            agent=agent,
+            raw_item=ResponseFunctionToolCall.model_construct(
+                type="function_call",
+                name="tool1",
+                call_id="cid1",
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_pending,
+                current_invocation=malformed_current,
+            )
+            is None
+        )
+        assert restored._context._tool_invocations == {}
+
+    @pytest.mark.parametrize("always_approve", [False, True])
+    async def test_serialized_apply_patch_approval_binds_plural_operations(
+        self,
+        always_approve: bool,
+    ):
+        """Changed plural apply-patch operations cannot reuse a restored decision."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "apply_patch_call",
+                "name": "apply_patch",
+                "call_id": "patch-call",
+                "operations": [{"type": "delete_file", "path": "safe.txt"}],
+            },
+            tool_name="apply_patch",
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item, always_approve=always_approve)
+
+        restored = await RunState.from_json(agent, state.to_json())
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "apply_patch_call",
+                "name": "apply_patch",
+                "call_id": "patch-call",
+                "operations": [{"type": "delete_file", "path": "important.txt"}],
+            },
+            tool_name="apply_patch",
+        )
+        with pytest.raises(ModelBehaviorError, match="unique call ID"):
+            restored._context.get_approval_status(
+                "apply_patch",
+                "patch-call",
+                existing_pending=restored_item,
+                current_invocation=changed_item,
+            )
+
     async def test_serializes_and_restores_rejection_messages(self):
         """Test that rejection messages are preserved through serialization."""
         context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
@@ -1704,6 +2604,40 @@ class TestRunState:
         assert restored._context.context == {"source": "override"}
         assert restored._context.get_rejection_message("tool2", "cid2") == "Denied by reviewer"
         assert restored._context.get_rejection_message("tool2", "cid3") == "Denied by reviewer"
+
+    async def test_context_override_discards_unbound_ids_from_previous_restore(self):
+        """Each restore rebuilds derived approval state on a reused context wrapper."""
+        agent = Agent(name="ApprovalOverrideAgent")
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="shared",
+                arguments='{"value":"safe"}',
+            ),
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        malformed = state.to_json()
+        malformed["context"]["tool_invocations"] = {}
+        valid = state.to_json()
+        override_context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+
+        await RunState.from_json(agent, malformed, context_override=override_context)
+        assert override_context._restored_unbound_approval_call_ids == {"shared"}
+
+        restored = await RunState.from_json(agent, valid, context_override=override_context)
+
+        assert restored._context is override_context
+        assert override_context._restored_unbound_approval_call_ids == set()
+        assert (
+            override_context.get_approval_status(
+                "tool1",
+                "shared",
+                current_invocation=approval_item,
+            )
+            is True
+        )
 
 
 class TestBuildAgentMap:
@@ -5587,6 +6521,7 @@ class TestRunStateSerializationEdgeCases:
                 "1.11",
                 "1.12",
                 "1.13",
+                "1.14",
                 CURRENT_SCHEMA_VERSION,
             }
         )
@@ -6446,8 +7381,8 @@ class TestToolApprovalItem:
 
         assert context.is_tool_approved(tool_name="explicit_name", call_id="call123") is True
 
-    def test_approve_tool_extracts_call_id_from_dict(self):
-        """Test that approve_tool extracts call_id from dict raw_item."""
+    def test_approve_tool_rejects_uncanonical_hosted_call_dict(self):
+        """A generic hosted call cannot create approval authority from its item ID."""
         context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
         agent = Agent(name="TestAgent")
         # Dict with hosted tool identifiers (id instead of call_id)
@@ -6458,9 +7393,10 @@ class TestToolApprovalItem:
         }
 
         approval_item = ToolApprovalItem(agent=agent, raw_item=raw_item)
-        context.approve_tool(approval_item)
+        with pytest.raises(ModelBehaviorError, match="canonical invocation identity"):
+            context.approve_tool(approval_item)
 
-        assert context.is_tool_approved(tool_name="hosted_tool", call_id="hosted_call_123") is True
+        assert context.is_tool_approved(tool_name="hosted_tool", call_id="hosted_call_123") is None
 
     def test_reject_tool_with_explicit_tool_name(self):
         """Test that reject_tool works with explicit tool_name."""
@@ -7604,24 +8540,33 @@ async def test_hosted_mcp_approval_round_trip_uses_typed_identity_records() -> N
     serialized = state.to_json()
 
     assert serialized["context"]["approvals"] == {}
-    assert serialized["context"]["hosted_mcp_approvals"] == [
+    hosted_approvals = serialized["context"]["hosted_mcp_approvals"]
+    assert [entry["identity"] for entry in hosted_approvals] == [
         {
-            "identity": {
-                "type": "server_tool",
-                "server_label": "server-a",
-                "tool_name": "lookup_account",
-            },
-            "decision": {"approved": True, "rejected": []},
+            "type": "server_tool",
+            "server_label": "server-a",
+            "tool_name": "lookup_account",
         },
         {
-            "identity": {
-                "type": "query",
-                "tool_name": "lookup_account",
-                "request_id": "request-a",
-            },
-            "decision": {"approved": ["request-a"], "rejected": []},
+            "type": "query",
+            "tool_name": "lookup_account",
+            "request_id": "request-a",
         },
     ]
+    server_decision = hosted_approvals[0]["decision"]
+    assert server_decision["approved"] is True
+    assert server_decision["rejected"] == []
+    assert isinstance(server_decision["sticky_scope"], str)
+    server_binding = serialized["context"]["tool_invocations"]["request-a"]
+    assert server_binding["type"] == "mcp_approval_request"
+    assert server_binding["approval_scope"] == server_decision["sticky_scope"]
+    assert isinstance(server_binding["fingerprint"], str)
+    assert server_binding["executed"] is False
+    assert server_binding["completed"] is False
+    query_decision = hosted_approvals[1]["decision"]
+    assert query_decision["approved"] == ["request-a"]
+    assert query_decision["rejected"] == []
+    assert "invocations" not in query_decision
     restored = await RunState.from_json(agent, serialized)
 
     assert restored._context is not None
@@ -7647,7 +8592,7 @@ async def test_hosted_mcp_approval_round_trip_uses_typed_identity_records() -> N
 
 
 @pytest.mark.asyncio
-async def test_incomplete_hosted_mcp_query_round_trip_preserves_exact_decision() -> None:
+async def test_incomplete_hosted_mcp_query_cannot_create_approval_authority() -> None:
     agent = Agent(name="test")
     context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
     state = make_state(agent, context=context)
@@ -7662,41 +8607,11 @@ async def test_incomplete_hosted_mcp_query_round_trip_preserves_exact_decision()
         },
         tool_name="lookup_account",
     )
-    state.reject(approval, rejection_message="exact denial")
+    with pytest.raises(ModelBehaviorError, match="canonical invocation identity"):
+        state.reject(approval, rejection_message="exact denial")
 
-    serialized = state.to_json()
-
-    assert serialized["context"]["hosted_mcp_approvals"] == [
-        {
-            "identity": {
-                "type": "request",
-                "request_id": "request-a",
-            },
-            "decision": {
-                "approved": [],
-                "rejected": ["request-a"],
-                "rejection_messages": {"request-a": "exact denial"},
-            },
-        },
-        {
-            "identity": {
-                "type": "query",
-                "tool_name": "lookup_account",
-                "request_id": "request-a",
-            },
-            "decision": {
-                "approved": [],
-                "rejected": ["request-a"],
-                "rejection_messages": {"request-a": "exact denial"},
-            },
-        },
-    ]
-    restored = await RunState.from_json(agent, serialized)
-
-    assert restored._context is not None
-    assert restored._context.is_tool_approved("lookup_account", "request-a") is False
-    assert restored._context.get_rejection_message("lookup_account", "request-a") == "exact denial"
-    assert restored._context.is_tool_approved("lookup_account", "request-next") is None
+    assert context._approvals == {}
+    assert state._serialize_hosted_mcp_approvals() == []
 
 
 @pytest.mark.asyncio
@@ -7794,7 +8709,7 @@ async def test_schema_1_13_ignores_typed_hosted_mcp_approval_records() -> None:
 
 
 @pytest.mark.asyncio
-async def test_schema_1_13_hosted_mcp_exact_call_decisions_remain_usable() -> None:
+async def test_schema_1_13_hosted_mcp_orphaned_call_decisions_require_reapproval() -> None:
     agent = Agent(name="test")
     context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
     context._rebuild_approvals(  # noqa: SLF001
@@ -7840,6 +8755,15 @@ async def test_schema_1_13_hosted_mcp_exact_call_decisions_remain_usable() -> No
             "request-approved",
             existing_pending=approved,
         )
+        is None
+    )
+    restored._context.approve_tool(approved)
+    assert (
+        restored._context.get_approval_status(
+            "lookup_account",
+            "request-approved",
+            existing_pending=approved,
+        )
         is True
     )
     assert (
@@ -7848,7 +8772,7 @@ async def test_schema_1_13_hosted_mcp_exact_call_decisions_remain_usable() -> No
             "request-rejected",
             existing_pending=rejected,
         )
-        is False
+        is None
     )
     assert (
         restored._context.get_rejection_message(

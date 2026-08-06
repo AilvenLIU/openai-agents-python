@@ -1564,6 +1564,8 @@ async def test_agent_as_tool_wrapped_hosted_mcp_exact_decision_resumes_run(
                 "type": "mcp_approval_request",
                 "id": "inner-1",
                 "name": "lookup_account",
+                "server_label": "accounts",
+                "arguments": "{}",
             },
         },
         tool_name="lookup_account",
@@ -1919,6 +1921,7 @@ async def test_agent_as_tool_deferred_same_name_legacy_nested_always_approve_sta
         approved=True,
         rejected=[],
     )
+    tool_context._allow_legacy_approval_binding_reconstruction = True
     resume_state = DummyState(nested_context)
     pending_result = DummyPendingResult()
     record_agent_tool_run_result(tool_call, cast(Any, pending_result))

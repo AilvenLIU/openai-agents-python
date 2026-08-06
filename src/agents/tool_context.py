@@ -134,7 +134,9 @@ class ToolContext(RunContextWrapper[TContext]):
         """
         # Grab the names of the RunContextWrapper's init=True fields
         base_values: dict[str, Any] = {
-            f.name: getattr(context, f.name) for f in fields(RunContextWrapper) if f.init
+            f.name: getattr(context, f.name)
+            for f in fields(RunContextWrapper)
+            if f.init and f.name != "_approvals"
         }
         resolved_tool_name = (
             tool_name
@@ -174,5 +176,6 @@ class ToolContext(RunContextWrapper[TContext]):
             run_config=tool_run_config,
             **base_values,
         )
+        context._share_tool_state_with(tool_context)
         set_agent_tool_state_scope(tool_context, get_agent_tool_state_scope(context))
         return tool_context
