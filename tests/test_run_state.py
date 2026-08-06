@@ -5425,6 +5425,37 @@ class TestRunStateSerializationEdgeCases:
             await RunState.from_json(agent, json_data)
 
     @pytest.mark.asyncio
+    async def test_schema_1_13_accepts_programmatic_tool_calling_items(self):
+        agent = Agent(name="TestAgent", tools=[ProgrammaticToolCallingTool()])
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        state._model_responses = [
+            ModelResponse(
+                output=[
+                    Program(
+                        id="program_item",
+                        call_id="call_program",
+                        code="lookup()",
+                        fingerprint="fingerprint",
+                        type="program",
+                    )
+                ],
+                usage=Usage(),
+                response_id="response_1",
+            )
+        ]
+        json_data = state.to_json()
+        json_data["$schemaVersion"] = "1.13"
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._schema_version == "1.13"
+        assert restored._model_responses[0].output[0].type == "program"
+
+    @pytest.mark.asyncio
     async def test_previous_schema_ignores_program_like_arbitrary_context(self):
         agent = Agent(name="TestAgent")
         state = make_state(
@@ -5460,6 +5491,7 @@ class TestRunStateSerializationEdgeCases:
                 "1.10",
                 "1.11",
                 "1.12",
+                "1.13",
                 CURRENT_SCHEMA_VERSION,
             }
         )
@@ -7195,3 +7227,164 @@ async def test_resume_rejected_function_approval_emits_output() -> None:
         for item in resumed.new_items
     )
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_hosted_mcp_approval_request_restores_matching_server_tool() -> None:
+    server_a = HostedMCPTool(
+        tool_config=Mcp(
+            type="mcp",
+            server_label="server-a",
+            server_url="https://server-a.example/mcp",
+        )
+    )
+    server_b = HostedMCPTool(
+        tool_config=Mcp(
+            type="mcp",
+            server_label="server-b",
+            server_url="https://server-b.example/mcp",
+        )
+    )
+    agent = Agent(name="test", tools=[server_a, server_b])
+    request_item = McpApprovalRequest(
+        id="request-a",
+        type="mcp_approval_request",
+        arguments="{}",
+        name="lookup_account",
+        server_label="server-a",
+    )
+    context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+    state = make_state(agent, context=context)
+    state._last_processed_response = make_processed_response(
+        mcp_approval_requests=[
+            ToolRunMCPApprovalRequest(
+                request_item=request_item,
+                mcp_tool=server_a,
+            )
+        ]
+    )
+
+    restored = await RunState.from_json(agent, state.to_json())
+
+    assert restored._last_processed_response is not None
+    restored_requests = restored._last_processed_response.mcp_approval_requests
+    assert len(restored_requests) == 1
+    assert restored_requests[0].mcp_tool is server_a
+
+
+@pytest.mark.asyncio
+async def test_hosted_mcp_approval_round_trip_uses_typed_identity_records() -> None:
+    agent = Agent(name="test")
+    context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+    state = make_state(agent, context=context)
+    approval = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="request-a",
+            type="mcp_approval_request",
+            arguments="{}",
+            name="lookup_account",
+            server_label="server-a",
+        ),
+    )
+    state.approve(approval, always_approve=True)
+
+    serialized = state.to_json()
+
+    assert serialized["context"]["approvals"] == {}
+    assert serialized["context"]["hosted_mcp_approvals"] == [
+        {
+            "identity": {
+                "type": "server_tool",
+                "server_label": "server-a",
+                "tool_name": "lookup_account",
+            },
+            "decision": {"approved": True, "rejected": []},
+        }
+    ]
+    restored = await RunState.from_json(agent, serialized)
+
+    assert restored._context is not None
+    assert (
+        restored._context.get_approval_status(
+            "lookup_account",
+            "request-next",
+            existing_pending=ToolApprovalItem(
+                agent=agent,
+                raw_item=McpApprovalRequest(
+                    id="request-next",
+                    type="mcp_approval_request",
+                    arguments="{}",
+                    name="lookup_account",
+                    server_label="server-a",
+                ),
+            ),
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_schema_1_13_hosted_mcp_exact_call_decisions_remain_usable() -> None:
+    agent = Agent(name="test")
+    context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+    context._rebuild_approvals(  # noqa: SLF001
+        {
+            "lookup_account": {
+                "approved": ["request-approved"],
+                "rejected": ["request-rejected"],
+                "rejection_messages": {"request-rejected": "legacy exact denial"},
+            }
+        }
+    )
+    state = make_state(agent, context=context)
+    serialized = state.to_json()
+    serialized["$schemaVersion"] = "1.13"
+
+    restored = await RunState.from_json(agent, serialized)
+
+    assert restored._context is not None
+    approved = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="request-approved",
+            type="mcp_approval_request",
+            arguments="{}",
+            name="lookup_account",
+            server_label="server-a",
+        ),
+    )
+    rejected = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="request-rejected",
+            type="mcp_approval_request",
+            arguments="{}",
+            name="lookup_account",
+            server_label="server-a",
+        ),
+    )
+    assert (
+        restored._context.get_approval_status(
+            "lookup_account",
+            "request-approved",
+            existing_pending=approved,
+        )
+        is True
+    )
+    assert (
+        restored._context.get_approval_status(
+            "lookup_account",
+            "request-rejected",
+            existing_pending=rejected,
+        )
+        is False
+    )
+    assert (
+        restored._context.get_rejection_message(
+            "lookup_account",
+            "request-rejected",
+            existing_pending=rejected,
+        )
+        == "legacy exact denial"
+    )

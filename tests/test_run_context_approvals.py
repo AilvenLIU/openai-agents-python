@@ -1,8 +1,395 @@
 from __future__ import annotations
 
-from agents import Agent, RunContextWrapper
+import pytest
+from openai.types.responses.response_output_item import McpApprovalRequest
+
+from agents import Agent, RunContextWrapper, ToolApprovalItem, UserError
 
 from .utils.factories import make_tool_approval_item
+
+
+def _make_hosted_mcp_approval_item(
+    agent: Agent[None],
+    *,
+    request_id: str,
+    server_label: str,
+    tool_name: str = "lookup_account",
+) -> ToolApprovalItem:
+    return ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id=request_id,
+            type="mcp_approval_request",
+            arguments="{}",
+            name=tool_name,
+            server_label=server_label,
+        ),
+    )
+
+
+def test_hosted_mcp_permanent_approval_is_scoped_by_server_label() -> None:
+    agent = Agent(name="test-agent")
+    context_wrapper = RunContextWrapper(context=None)
+    server_a = _make_hosted_mcp_approval_item(
+        agent,
+        request_id="request-a-1",
+        server_label="server-a",
+    )
+    server_a_next = _make_hosted_mcp_approval_item(
+        agent,
+        request_id="request-a-2",
+        server_label="server-a",
+    )
+    server_b = _make_hosted_mcp_approval_item(
+        agent,
+        request_id="request-b-1",
+        server_label="server-b",
+    )
+
+    context_wrapper.approve_tool(server_a, always_approve=True)
+
+    assert (
+        context_wrapper.get_approval_status(
+            "lookup_account",
+            "request-a-2",
+            existing_pending=server_a_next,
+        )
+        is True
+    )
+    assert (
+        context_wrapper.get_approval_status(
+            "lookup_account",
+            "request-b-1",
+            existing_pending=server_b,
+        )
+        is None
+    )
+    assert "lookup_account" not in context_wrapper._approvals
+
+
+def test_hosted_mcp_permanent_rejection_message_is_scoped_by_server_label() -> None:
+    agent = Agent(name="test-agent")
+    context_wrapper = RunContextWrapper(context=None)
+    server_a = _make_hosted_mcp_approval_item(
+        agent,
+        request_id="request-a-1",
+        server_label="server-a",
+    )
+    server_a_next = _make_hosted_mcp_approval_item(
+        agent,
+        request_id="request-a-2",
+        server_label="server-a",
+    )
+    server_b = _make_hosted_mcp_approval_item(
+        agent,
+        request_id="request-b-1",
+        server_label="server-b",
+    )
+
+    context_wrapper.reject_tool(
+        server_a,
+        always_reject=True,
+        rejection_message="server-a denied",
+    )
+
+    assert (
+        context_wrapper.get_rejection_message(
+            "lookup_account",
+            "request-a-2",
+            existing_pending=server_a_next,
+        )
+        == "server-a denied"
+    )
+    assert (
+        context_wrapper.get_approval_status(
+            "lookup_account",
+            "request-b-1",
+            existing_pending=server_b,
+        )
+        is None
+    )
+    assert (
+        context_wrapper.get_rejection_message(
+            "lookup_account",
+            "request-b-1",
+            existing_pending=server_b,
+        )
+        is None
+    )
+
+
+def test_hosted_mcp_legacy_bare_name_approval_does_not_grant_access() -> None:
+    agent = Agent(name="test-agent")
+    context_wrapper = RunContextWrapper(context=None)
+    pending = _make_hosted_mcp_approval_item(
+        agent,
+        request_id="request-a-1",
+        server_label="server-a",
+    )
+    context_wrapper._rebuild_approvals(  # noqa: SLF001
+        {"lookup_account": {"approved": True, "rejected": []}}
+    )
+
+    assert (
+        context_wrapper.get_approval_status(
+            "lookup_account",
+            "request-a-1",
+            existing_pending=pending,
+        )
+        is None
+    )
+
+
+def test_hosted_mcp_scoped_identity_cannot_alias_legacy_tool_name() -> None:
+    agent = Agent(name="test-agent")
+    context_wrapper = RunContextWrapper(context=None)
+    pending = _make_hosted_mcp_approval_item(
+        agent,
+        request_id="request-a-1",
+        server_label="server-a",
+    )
+    colliding_legacy_name = '["hosted_mcp","server-a","lookup_account"]'
+    context_wrapper._rebuild_approvals(  # noqa: SLF001
+        {colliding_legacy_name: {"approved": True, "rejected": []}}
+    )
+
+    assert context_wrapper.is_tool_approved(colliding_legacy_name, "legacy-call") is True
+    assert (
+        context_wrapper.get_approval_status(
+            "lookup_account",
+            "request-a-1",
+            existing_pending=pending,
+        )
+        is None
+    )
+
+
+def test_hosted_mcp_legacy_exact_call_decisions_remain_usable() -> None:
+    agent = Agent(name="test-agent")
+    context_wrapper = RunContextWrapper(context=None)
+    approved = _make_hosted_mcp_approval_item(
+        agent,
+        request_id="request-approved",
+        server_label="server-a",
+    )
+    rejected = _make_hosted_mcp_approval_item(
+        agent,
+        request_id="request-rejected",
+        server_label="server-a",
+    )
+    context_wrapper._rebuild_approvals(  # noqa: SLF001
+        {
+            "lookup_account": {
+                "approved": ["request-approved"],
+                "rejected": ["request-rejected"],
+                "rejection_messages": {"request-rejected": "legacy exact denial"},
+            }
+        }
+    )
+
+    assert (
+        context_wrapper.get_approval_status(
+            "lookup_account",
+            "request-approved",
+            existing_pending=approved,
+        )
+        is True
+    )
+    assert (
+        context_wrapper.get_approval_status(
+            "lookup_account",
+            "request-rejected",
+            existing_pending=rejected,
+        )
+        is False
+    )
+    assert (
+        context_wrapper.get_rejection_message(
+            "lookup_account",
+            "request-rejected",
+            existing_pending=rejected,
+        )
+        == "legacy exact denial"
+    )
+
+
+def test_hosted_mcp_persistent_decision_requires_complete_identity() -> None:
+    agent = Agent(name="test-agent")
+    context_wrapper = RunContextWrapper(context=None)
+    malformed = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "hosted_tool_call",
+            "name": "lookup_account",
+            "provider_data": {
+                "type": "mcp_approval_request",
+                "id": "request-a-1",
+            },
+        },
+    )
+
+    with pytest.raises(UserError, match="non-empty server_label and tool name"):
+        context_wrapper.approve_tool(malformed, always_approve=True)
+
+
+def test_incomplete_hosted_mcp_uses_only_exact_call_decisions() -> None:
+    agent = Agent(name="test-agent")
+    malformed = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "hosted_tool_call",
+            "name": "lookup_account",
+            "id": "request-a-1",
+            "provider_data": {
+                "type": "mcp_approval_request",
+                "id": "request-a-1",
+            },
+        },
+    )
+    context_wrapper = RunContextWrapper(context=None)
+    context_wrapper._rebuild_approvals(  # noqa: SLF001
+        {
+            "lookup_account": {
+                "approved": True,
+                "rejected": True,
+                "sticky_rejection_message": "legacy denial",
+            }
+        }
+    )
+
+    assert (
+        context_wrapper.get_approval_status(
+            "lookup_account",
+            "request-a-1",
+            existing_pending=malformed,
+        )
+        is None
+    )
+    assert (
+        context_wrapper.get_rejection_message(
+            "lookup_account",
+            "request-a-1",
+            existing_pending=malformed,
+        )
+        is None
+    )
+
+    context_wrapper.approve_tool(malformed)
+    assert (
+        context_wrapper.get_approval_status(
+            "lookup_account",
+            "request-a-1",
+            existing_pending=malformed,
+        )
+        is True
+    )
+
+    context_wrapper.reject_tool(malformed, rejection_message="exact denial")
+    assert (
+        context_wrapper.get_approval_status(
+            "lookup_account",
+            "request-a-1",
+            existing_pending=malformed,
+        )
+        is False
+    )
+    assert (
+        context_wrapper.get_rejection_message(
+            "lookup_account",
+            "request-a-1",
+            existing_pending=malformed,
+        )
+        == "exact denial"
+    )
+
+
+def test_hosted_mcp_decision_requires_request_id() -> None:
+    agent = Agent(name="test-agent")
+    context_wrapper = RunContextWrapper(context=None)
+    malformed = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "hosted_tool_call",
+            "name": "lookup_account",
+            "provider_data": {
+                "type": "mcp_approval_request",
+                "server_label": "server-a",
+            },
+        },
+    )
+
+    with pytest.raises(UserError, match="non-empty request id"):
+        context_wrapper.approve_tool(malformed)
+
+    assert context_wrapper._approvals == {}  # noqa: SLF001
+
+
+@pytest.mark.parametrize("request_id", ["", 123])
+def test_hosted_mcp_invalid_request_id_does_not_mutate_approvals(request_id: object) -> None:
+    agent = Agent(name="test-agent")
+    context_wrapper = RunContextWrapper(context=None)
+    malformed = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "mcp_approval_request",
+            "id": request_id,
+            "arguments": "{}",
+            "name": "lookup_account",
+            "server_label": "server-a",
+        },
+    )
+
+    with pytest.raises(UserError, match="non-empty request id"):
+        context_wrapper.reject_tool(
+            malformed,
+            always_reject=True,
+            rejection_message="must not persist",
+        )
+
+    assert context_wrapper._approvals == {}  # noqa: SLF001
+
+
+def test_hosted_mcp_provider_invalid_request_id_does_not_fall_back_to_outer_id() -> None:
+    agent = Agent(name="test-agent")
+    context_wrapper = RunContextWrapper(context=None)
+    malformed = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "hosted_tool_call",
+            "call_id": "outer-id",
+            "name": "lookup_account",
+            "provider_data": {
+                "type": "mcp_approval_request",
+                "id": 123,
+                "server_label": "server-a",
+                "name": "lookup_account",
+            },
+        },
+    )
+
+    with pytest.raises(UserError, match="non-empty request id"):
+        context_wrapper.approve_tool(malformed)
+
+    assert context_wrapper._approvals == {}  # noqa: SLF001
+
+
+def test_hosted_mcp_request_type_is_not_used_as_missing_tool_name() -> None:
+    agent = Agent(name="test-agent")
+    context_wrapper = RunContextWrapper(context=None)
+    malformed = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "mcp_approval_request",
+            "id": "request-a-1",
+            "arguments": "{}",
+            "server_label": "server-a",
+        },
+    )
+
+    with pytest.raises(UserError, match="non-empty server_label and tool name"):
+        context_wrapper.approve_tool(malformed, always_approve=True)
+
+    assert context_wrapper._approvals == {}  # noqa: SLF001
 
 
 def test_latest_approval_decision_wins_for_call_id() -> None:

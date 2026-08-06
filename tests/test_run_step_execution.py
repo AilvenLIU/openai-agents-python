@@ -3409,6 +3409,200 @@ async def test_execute_tools_surfaces_hosted_mcp_interruptions_without_callback(
     )
 
 
+def test_manual_hosted_mcp_approval_does_not_reuse_stale_pending_identity():
+    server_b = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-b",
+            "server_url": "https://server-b.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server_b])
+    pending_a = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="shared-request",
+            type="mcp_approval_request",
+            server_label="server-a",
+            arguments="{}",
+            name="lookup_account",
+        ),
+    )
+    current_b = McpApprovalRequest(
+        id="shared-request",
+        type="mcp_approval_request",
+        server_label="server-b",
+        arguments="{}",
+        name="lookup_account",
+    )
+    request_run = ToolRunMCPApprovalRequest(request_item=current_b, mcp_tool=server_b)
+    context_wrapper = make_context_wrapper()
+    context_wrapper._rebuild_approvals(  # noqa: SLF001
+        {"lookup_account": {"approved": ["shared-request"], "rejected": []}}
+    )
+
+    approved, pending = tool_execution.collect_manual_mcp_approvals(
+        agent=agent,
+        requests=[request_run],
+        context_wrapper=context_wrapper,
+        existing_pending_by_call_id={"shared-request": pending_a},
+    )
+
+    assert approved == []
+    assert len(pending) == 1
+    assert pending[0].raw_item is current_b
+
+
+def test_resumed_hosted_mcp_approval_does_not_reuse_stale_pending_identity():
+    server_b = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-b",
+            "server_url": "https://server-b.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server_b])
+    pending_a = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="shared-request",
+            type="mcp_approval_request",
+            server_label="server-a",
+            arguments="{}",
+            name="lookup_account",
+        ),
+    )
+    current_b = McpApprovalRequest(
+        id="shared-request",
+        type="mcp_approval_request",
+        server_label="server-b",
+        arguments="{}",
+        name="lookup_account",
+    )
+    request_run = ToolRunMCPApprovalRequest(request_item=current_b, mcp_tool=server_b)
+    context_wrapper = make_context_wrapper()
+    context_wrapper._rebuild_approvals(  # noqa: SLF001
+        {
+            "lookup_account": {
+                "approved": [],
+                "rejected": ["shared-request"],
+                "rejection_messages": {"shared-request": "stale denial"},
+            }
+        }
+    )
+    appended: list[RunItem] = []
+
+    pending, pending_ids = tool_execution.process_hosted_mcp_approvals(
+        original_pre_step_items=[pending_a],
+        mcp_approval_requests=[request_run],
+        context_wrapper=context_wrapper,
+        agent=agent,
+        append_item=appended.append,
+    )
+
+    assert pending_ids == {"shared-request"}
+    assert len(pending) == 1
+    assert pending[0].raw_item is current_b
+    assert appended == pending
+
+
+def test_manual_hosted_mcp_approval_keeps_incomplete_exact_call_decision():
+    server_a = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-a",
+            "server_url": "https://server-a.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server_a])
+    pending_unknown = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "hosted_tool_call",
+            "provider_data": {
+                "type": "mcp_approval_request",
+                "id": "shared-request",
+            },
+        },
+    )
+    current = McpApprovalRequest(
+        id="shared-request",
+        type="mcp_approval_request",
+        server_label="server-a",
+        arguments="{}",
+        name="lookup_account",
+    )
+    request_run = ToolRunMCPApprovalRequest(request_item=current, mcp_tool=server_a)
+    context_wrapper = make_context_wrapper()
+    context_wrapper.approve_tool(pending_unknown)
+
+    approved, pending = tool_execution.collect_manual_mcp_approvals(
+        agent=agent,
+        requests=[request_run],
+        context_wrapper=context_wrapper,
+        existing_pending_by_call_id={"shared-request": pending_unknown},
+    )
+
+    assert pending == []
+    assert len(approved) == 1
+    assert approved[0].raw_item["approve"] is True
+
+
+def test_incomplete_current_hosted_mcp_request_does_not_reuse_scoped_pending_identity():
+    server_a = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-a",
+            "server_url": "https://server-a.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server_a])
+    pending_complete = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="shared-request",
+            type="mcp_approval_request",
+            server_label="server-a",
+            arguments="{}",
+            name="lookup_account",
+        ),
+    )
+    current_incomplete = McpApprovalRequest.model_construct(
+        id="shared-request",
+        type="mcp_approval_request",
+        arguments="{}",
+    )
+    request_run = ToolRunMCPApprovalRequest(
+        request_item=current_incomplete,
+        mcp_tool=server_a,
+    )
+    context_wrapper = make_context_wrapper()
+    context_wrapper.approve_tool(pending_complete, always_approve=True)
+
+    approved, manual_pending = tool_execution.collect_manual_mcp_approvals(
+        agent=agent,
+        requests=[request_run],
+        context_wrapper=context_wrapper,
+        existing_pending_by_call_id={"shared-request": pending_complete},
+    )
+    appended: list[RunItem] = []
+    resumed_pending, pending_ids = tool_execution.process_hosted_mcp_approvals(
+        original_pre_step_items=[pending_complete],
+        mcp_approval_requests=[request_run],
+        context_wrapper=context_wrapper,
+        agent=agent,
+        append_item=appended.append,
+    )
+
+    assert approved == []
+    assert len(manual_pending) == 1
+    assert manual_pending[0].raw_item is current_incomplete
+    assert pending_ids == {"shared-request"}
+    assert len(resumed_pending) == 1
+    assert resumed_pending[0].raw_item is current_incomplete
+    assert appended == resumed_pending
+
+
 @pytest.mark.asyncio
 async def test_execute_tools_uses_public_agent_for_hosted_mcp_interruptions():
     """Hosted MCP approval items should expose the public agent when execution uses a clone."""
