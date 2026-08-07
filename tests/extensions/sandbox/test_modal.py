@@ -62,6 +62,18 @@ def _set_aio_attr(obj: object, name: str, fn: Callable[..., object]) -> None:
     setattr(obj, name, _with_aio(fn))
 
 
+@pytest.fixture(autouse=True)
+def _trust_recording_mounts_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agents.sandbox import _mount_security
+
+    original = _mount_security._mount_class_is_trusted
+    monkeypatch.setattr(
+        _mount_security,
+        "_mount_class_is_trusted",
+        lambda mount: isinstance(mount, _RecordingMount) or original(mount),
+    )
+
+
 class _RecordingMount(Mount):
     type: str = "modal_recording_mount"
     mount_strategy: InContainerMountStrategy = Field(
@@ -3899,3 +3911,41 @@ async def test_modal_pty_start_cleans_up_unregistered_process_on_cancellation(
 
     assert sandbox.process.terminate_calls == 1
     assert session._pty_processes == {}  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_modal_direct_persist_redacts_protected_mount_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    sentinel = "direct-modal-persist-secret"
+    source_error = RuntimeError(f"provider echoed {sentinel}")
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(
+            root="/workspace",
+            entries={
+                "remote": S3Mount(
+                    bucket="bucket",
+                    mount_strategy=modal_module.ModalCloudBucketMountStrategy(secret_name=sentinel),
+                )
+            },
+        ),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        sandbox_id="sb-direct-persist",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+
+    async def fail_persist() -> io.IOBase:
+        raise source_error
+
+    monkeypatch.setattr(session, "_persist_workspace_via_tar", fail_persist)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        await session.persist_workspace()
+
+    assert sentinel not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None

@@ -8,6 +8,7 @@ import json
 import sys
 import tarfile
 import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -15,13 +16,15 @@ import httpx
 import pytest
 from pydantic import BaseModel, PrivateAttr
 
-from agents.sandbox import Manifest, SandboxPathGrant
+from agents.sandbox import Manifest, SandboxAgent, SandboxPathGrant, SandboxRunConfig
+from agents.sandbox.capabilities import Capability
 from agents.sandbox.entries import (
     Dir,
     File,
     InContainerMountStrategy,
     Mount,
     MountpointMountPattern,
+    RcloneMountPattern,
     S3Mount,
 )
 from agents.sandbox.entries.mounts.base import InContainerMountAdapter
@@ -33,6 +36,7 @@ from agents.sandbox.errors import (
 )
 from agents.sandbox.manifest import EnvEntry, Environment, StrEnvValue
 from agents.sandbox.materialization import MaterializedFile
+from agents.sandbox.runtime_session_manager import SandboxRuntimeSessionManager
 from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
 from agents.sandbox.session.dependencies import Dependencies
 from agents.sandbox.session.manager import Instrumentation
@@ -40,6 +44,7 @@ from agents.sandbox.session.sinks import CallbackSink
 from agents.sandbox.snapshot import NoopSnapshot, SnapshotBase
 from agents.sandbox.types import User
 from tests._fake_workspace_paths import resolve_fake_workspace_path
+from tests.fake_model import FakeModel
 
 
 class _FakeNetworkPolicyRule(BaseModel):
@@ -111,6 +116,43 @@ class _FakeVercelSandboxServerError(_FakeVercelAPIError):
 class _FakeVercelSandboxValidationError(_FakeVercelSandboxError):
     def __init__(self, message: str = "validation failed") -> None:
         super().__init__(message)
+
+
+def _install_hostile_exception_descriptors(
+    error_type: type[BaseException],
+    *,
+    reject_stringification: bool,
+) -> None:
+    def get_base_args(error: BaseException) -> tuple[object, ...]:
+        return cast(
+            tuple[object, ...],
+            cast(Any, BaseException.args).__get__(error, type(error)),
+        )
+
+    def reject_slot_access(error: BaseException) -> object:
+        _ = error
+        raise AssertionError("provider-defined exception descriptor was accessed")
+
+    type.__setattr__(error_type, "args", property(get_base_args))
+    for name in ("__traceback__", "__cause__", "__context__"):
+        type.__setattr__(error_type, name, property(reject_slot_access))
+    if reject_stringification:
+
+        def reject_string_access(error: BaseException) -> str:
+            _ = error
+            raise RuntimeError("provider exception stringification failed")
+
+        type.__setattr__(error_type, "__str__", reject_string_access)
+
+
+def _assert_base_exception_slots_cleared(error: BaseException) -> None:
+    assert cast(Any, BaseException.args).__get__(error, type(error)) == ()
+    for descriptor in (
+        cast(Any, BaseException.__traceback__),
+        cast(Any, BaseException.__cause__),
+        cast(Any, BaseException.__context__),
+    ):
+        assert descriptor.__get__(error, type(error)) is None
 
 
 class _MemorySnapshot(SnapshotBase):
@@ -393,9 +435,20 @@ class _FakeAsyncSandbox:
         return _FakeAsyncSnapshot(snapshot_id)
 
 
+@pytest.fixture(autouse=True)
+def _trust_recording_mounts_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agents.sandbox import _mount_security
+
+    original = _mount_security._mount_class_is_trusted
+    monkeypatch.setattr(
+        _mount_security,
+        "_mount_class_is_trusted",
+        lambda mount: isinstance(mount, _RecordingMount) or original(mount),
+    )
+
+
 class _RecordingMount(Mount):
     type: str = "test_vercel_recording_mount"
-    bucket: str = "bucket"
     _events: list[tuple[str, str]] = PrivateAttr(default_factory=list)
 
     def supported_in_container_patterns(
@@ -562,14 +615,49 @@ async def test_vercel_create_requires_explicit_s3_credential_exposure(
     vercel_module = _load_vercel_module(monkeypatch)
     package_module = importlib.import_module("agents.extensions.sandbox.vercel")
     client = vercel_module.VercelSandboxClient()
+    manifest = _vercel_s3_manifest(package_module, credentials=True)
 
-    with pytest.raises(MountConfigError, match="allow_s3_credential_exposure"):
+    with pytest.raises(MountConfigError, match="cloud credentials are not supported") as exc:
         await client.create(
-            manifest=_vercel_s3_manifest(package_module, credentials=True),
+            manifest=manifest,
             options=vercel_module.VercelSandboxClientOptions(),
         )
 
     assert _FakeAsyncSandbox.create_calls == []
+    traceback = exc.value.__traceback__
+    while traceback is not None:
+        module_name = traceback.tb_frame.f_globals.get("__name__", "")
+        if isinstance(module_name, str) and module_name.startswith("agents."):
+            assert "test-secret-key" not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+@pytest.mark.asyncio
+async def test_vercel_injected_session_accepts_unchanged_s3_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    client = vercel_module.VercelSandboxClient()
+    session = await client.create(
+        manifest=_vercel_s3_manifest(package_module),
+        options=vercel_module.VercelSandboxClientOptions(),
+    )
+    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(session=session),
+        run_state=None,
+    )
+
+    manager.acquire_agent(agent)
+    restored = await manager.ensure_session(
+        agent=agent,
+        capabilities=[Capability(type="noop")],
+        is_resumed_state=False,
+    )
+
+    assert restored is session
 
 
 @pytest.mark.asyncio
@@ -589,6 +677,95 @@ async def test_vercel_create_revalidates_mutated_s3_mount(
         )
 
     assert _FakeAsyncSandbox.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_vercel_credential_opt_in_does_not_allow_signed_endpoint_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    manifest = _vercel_s3_manifest(package_module, credentials=True)
+    mount = cast(S3Mount, manifest.entries["remote"])
+    mount.endpoint_url = "https://example.test?signature=endpoint-secret"
+
+    with pytest.raises(MountConfigError, match="cloud credentials are not supported"):
+        await vercel_module.VercelSandboxClient().create(
+            manifest=manifest,
+            options=vercel_module.VercelSandboxClientOptions(
+                allow_s3_credential_exposure=True,
+            ),
+        )
+
+    assert _FakeAsyncSandbox.create_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_configuration", ["partial_credentials", "workspace_root"])
+async def test_vercel_credential_opt_in_redacts_provider_validation_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_configuration: str,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    sentinel = "vercel-validation-secret"
+    manifest = _vercel_s3_manifest(package_module, credentials=True)
+    mount = cast(S3Mount, manifest.entries["remote"])
+    mount.secret_access_key = sentinel
+    if invalid_configuration == "partial_credentials":
+        mount.access_key_id = None
+    else:
+        manifest.root = "/custom-workspace"
+        mount.mount_path = Path("/custom-workspace")
+
+    with pytest.raises(MountConfigError) as exc:
+        await vercel_module.VercelSandboxClient().create(
+            manifest=manifest,
+            options=vercel_module.VercelSandboxClientOptions(
+                allow_s3_credential_exposure=True,
+            ),
+        )
+
+    assert sentinel not in str(exc.value)
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
+    traceback = exc.value.__traceback__
+    while traceback is not None:
+        frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert sentinel not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+    assert _FakeAsyncSandbox.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_vercel_apply_manifest_uses_central_mount_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    manifest = Manifest(
+        entries={
+            "remote": S3Mount(
+                bucket="example-bucket",
+                access_key_id="example-access-key",
+                secret_access_key="example-secret-key",
+                mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+            )
+        }
+    )
+    state = vercel_module.VercelSandboxSessionState(
+        session_id="00000000-0000-0000-0000-000000000300",
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        sandbox_id="sandbox-central-validation",
+    )
+    sandbox = _FakeAsyncSandbox(sandbox_id="sandbox-central-validation")
+    session = vercel_module.VercelSandboxSession.from_state(state, sandbox=sandbox)
+
+    with pytest.raises(MountConfigError, match="cloud credentials are not supported"):
+        await session.apply_manifest()
+
+    assert sandbox.run_command_calls == []
 
 
 @pytest.mark.asyncio
@@ -718,9 +895,15 @@ async def test_vercel_s3_mount_is_create_time_only_and_credentials_are_not_seria
         "remote": remote_mount,
     }
     write_call_count = len(sandbox.write_files_calls)
-    with pytest.raises(MountConfigError, match="dynamic manifest application"):
+    with pytest.raises(MountConfigError, match="dynamic manifest application") as exc:
         await session.apply_manifest(only_ephemeral=True)
     assert len(sandbox.write_files_calls) == write_call_count
+    traceback = exc.value.__traceback__
+    while traceback is not None:
+        frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert "test-secret-key" not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
 
     session.state.manifest.entries.pop("remote")
     mutated_payload = client.serialize_session_state(session.state)
@@ -1034,6 +1217,33 @@ async def test_vercel_s3_nested_activation_serializes_workspace_commands(
 
 
 @pytest.mark.asyncio
+async def test_vercel_s3_mount_lock_does_not_leak_to_child_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    session = await vercel_module.VercelSandboxClient().create(
+        manifest=_vercel_s3_manifest(package_module),
+        options=vercel_module.VercelSandboxClientOptions(),
+    )
+    inner = session._inner
+    child_entered = asyncio.Event()
+
+    async def enter_from_child() -> None:
+        async with inner._s3_mount_operation(force_lock=True):
+            child_entered.set()
+
+    async with inner._s3_mount_operation(force_lock=True):
+        child_task = asyncio.create_task(enter_from_child())
+        await asyncio.sleep(0)
+        assert not child_entered.is_set()
+
+    await asyncio.wait_for(child_task, timeout=1)
+    assert child_entered.is_set()
+    await session.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_vercel_s3_manifest_sanitization_preserves_typed_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1244,6 +1454,40 @@ async def test_vercel_s3_aclose_retries_failed_transition_stop(
 
 
 @pytest.mark.asyncio
+async def test_vercel_s3_shutdown_preserves_first_stop_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    session = await vercel_module.VercelSandboxClient().create(
+        manifest=_vercel_s3_manifest(package_module),
+        options=vercel_module.VercelSandboxClientOptions(),
+    )
+    sandbox = cast(_FakeAsyncSandbox, session._inner._sandbox)
+    _queue_successful_s3_mounts(sandbox)
+    sandbox.command_results.update(
+        {
+            "/usr/bin/findmnt": [
+                _FakeCommandFinished(stdout="mountpoint-s3"),
+                _FakeCommandFinished(stdout="mountpoint-s3"),
+            ],
+            "/usr/bin/umount": [_FakeCommandFinished(stderr="busy", exit_code=32)],
+        }
+    )
+    sandbox.stop_failures = [
+        RuntimeError("first stop failed"),
+        RuntimeError("second stop failed"),
+    ]
+    await session.start()
+
+    with pytest.raises(RuntimeError, match="first stop failed"):
+        await session.shutdown()
+
+    assert sandbox.stop_calls == 2
+    assert sandbox.stop_blocking_calls == [True, True]
+
+
+@pytest.mark.asyncio
 async def test_vercel_s3_missing_tracked_mount_stops_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1303,7 +1547,7 @@ async def test_vercel_s3_mount_disappearing_during_unmount_stops_session(
 
 
 @pytest.mark.asyncio
-async def test_vercel_s3_unexpected_persist_error_stops_session(
+async def test_vercel_s3_unexpected_persist_error_restores_mount(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vercel_module = _load_vercel_module(monkeypatch)
@@ -1315,7 +1559,7 @@ async def test_vercel_s3_unexpected_persist_error_stops_session(
         options=vercel_module.VercelSandboxClientOptions(),
     )
     sandbox = cast(_FakeAsyncSandbox, session._inner._sandbox)
-    _queue_successful_s3_mounts(sandbox)
+    _queue_successful_s3_mounts(sandbox, count=2)
     await session.start()
     sandbox.command_results.update(
         {
@@ -1333,12 +1577,19 @@ async def test_vercel_s3_unexpected_persist_error_stops_session(
     with pytest.raises(vercel_module.WorkspaceReadNotFoundError):
         await session.persist_workspace()
 
-    assert sandbox.stop_calls == 1
-    assert session._inner._sandbox is None
-    with pytest.raises(vercel_module.WorkspaceStartError) as exc_info:
-        await session.exec("true", shell=False)
-    assert exc_info.value.context["reason"] == "mount_transition_failed"
+    assert sandbox.stop_calls == 0
+    assert session._inner._sandbox is sandbox
+    assert session._inner._active_s3_mount_paths == {"/vercel/sandbox/remote"}
+    assert session._inner._detached_s3_mount_paths == set()
+    assert (await session.exec("true", shell=False)).ok()
+    sandbox.command_results.update(
+        {
+            "/usr/bin/findmnt": [_FakeCommandFinished(stdout="mountpoint-s3")],
+            "/usr/bin/umount": [_FakeCommandFinished()],
+        }
+    )
     await session.shutdown()
+    assert sandbox.stop_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1523,7 +1774,7 @@ async def test_vercel_s3_closed_session_does_not_recreate_sandbox(
 
 
 @pytest.mark.asyncio
-async def test_vercel_s3_mount_cancellation_stops_and_marks_session_unusable(
+async def test_vercel_s3_mount_cancellation_settles_and_restores_mount(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vercel_module = _load_vercel_module(monkeypatch)
@@ -1535,7 +1786,7 @@ async def test_vercel_s3_mount_cancellation_stops_and_marks_session_unusable(
         options=vercel_module.VercelSandboxClientOptions(),
     )
     sandbox = cast(_FakeAsyncSandbox, session._inner._sandbox)
-    _queue_successful_s3_mounts(sandbox)
+    _queue_successful_s3_mounts(sandbox, count=2)
     output_started = asyncio.Event()
     hold_output = asyncio.Event()
 
@@ -1556,15 +1807,24 @@ async def test_vercel_s3_mount_cancellation_stops_and_marks_session_unusable(
     stop_task = asyncio.create_task(session.stop())
     await asyncio.wait_for(output_started.wait(), timeout=1)
     stop_task.cancel()
+    hold_output.set()
     with pytest.raises(asyncio.CancelledError):
         await stop_task
 
-    create_count = len(_FakeAsyncSandbox.create_calls)
-    with pytest.raises(vercel_module.WorkspaceStartError, match="failed to start session"):
-        await session.exec("true", shell=False)
-    assert sandbox.stop_calls == 1
-    assert len(_FakeAsyncSandbox.create_calls) == create_count
+    assert sandbox.stop_calls == 0
+    assert session._inner._sandbox is sandbox
+    assert session._inner._active_s3_mount_paths == {"/vercel/sandbox/remote"}
+    assert session._inner._detached_s3_mount_paths == set()
+    assert session._inner._s3_mount_failure is None
+    assert (await session.exec("true", shell=False)).ok()
+    sandbox.command_results.update(
+        {
+            "/usr/bin/findmnt": [_FakeCommandFinished(stdout="mountpoint-s3")],
+            "/usr/bin/umount": [_FakeCommandFinished()],
+        }
+    )
     await session.shutdown()
+    assert sandbox.stop_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1606,7 +1866,7 @@ async def test_vercel_s3_shutdown_cancellation_finishes_stop_and_marks_session_u
 
 
 @pytest.mark.asyncio
-async def test_vercel_s3_archive_cancellation_stops_detached_session(
+async def test_vercel_s3_archive_cancellation_restores_mount(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vercel_module = _load_vercel_module(monkeypatch)
@@ -1618,7 +1878,7 @@ async def test_vercel_s3_archive_cancellation_stops_detached_session(
         options=vercel_module.VercelSandboxClientOptions(),
     )
     sandbox = cast(_FakeAsyncSandbox, session._inner._sandbox)
-    _queue_successful_s3_mounts(sandbox)
+    _queue_successful_s3_mounts(sandbox, count=2)
     sandbox.command_results.update(
         {
             "/usr/bin/findmnt": [_FakeCommandFinished(stdout="mountpoint-s3")],
@@ -1637,12 +1897,20 @@ async def test_vercel_s3_archive_cancellation_stops_detached_session(
     with pytest.raises(asyncio.CancelledError):
         await stop_task
 
-    create_count = len(_FakeAsyncSandbox.create_calls)
-    with pytest.raises(vercel_module.WorkspaceStartError, match="failed to start session"):
-        await session.exec("true", shell=False)
-    assert sandbox.stop_calls == 1
-    assert len(_FakeAsyncSandbox.create_calls) == create_count
+    assert sandbox.stop_calls == 0
+    assert session._inner._sandbox is sandbox
+    assert session._inner._active_s3_mount_paths == {"/vercel/sandbox/remote"}
+    assert session._inner._detached_s3_mount_paths == set()
+    assert session._inner._s3_mount_failure is None
+    assert (await session.exec("true", shell=False)).ok()
+    sandbox.command_results.update(
+        {
+            "/usr/bin/findmnt": [_FakeCommandFinished(stdout="mountpoint-s3")],
+            "/usr/bin/umount": [_FakeCommandFinished()],
+        }
+    )
     await session.shutdown()
+    assert sandbox.stop_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1874,7 +2142,8 @@ async def test_vercel_s3_mount_failure_redacts_full_activation_traceback(
         "/usr/bin/find": [_FakeCommandFinished()],
     }
     secrets = ("test-access-key", "test-secret-key", "test-session-token")
-    provider_error = _FakeVercelSandboxRateLimitError(f"provider rejected {secrets[1]}")
+    transformed_secret = "test%2Dsecret%2Dkey"
+    provider_error = _FakeVercelSandboxRateLimitError(f"provider rejected {transformed_secret}")
     original_run_command = sandbox.run_command
 
     def assert_activation_traceback_is_redacted(error: BaseException) -> None:
@@ -1910,9 +2179,9 @@ async def test_vercel_s3_mount_failure_redacts_full_activation_traceback(
     with pytest.raises(MountCommandError) as exc_info:
         await session.start()
 
-    assert exc_info.value.context["stderr"] == (
-        "_FakeVercelSandboxRateLimitError: provider rejected REDACTED"
-    )
+    assert exc_info.value.context["stderr"] == "sandbox provider command failed"
+    assert transformed_secret not in str(exc_info.value)
+    assert transformed_secret not in repr(exc_info.value.context)
     assert exc_info.value.retryable is True
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
@@ -1920,6 +2189,140 @@ async def test_vercel_s3_mount_failure_redacts_full_activation_traceback(
     assert provider_error.__cause__ is None
     assert provider_error.__context__ is None
     assert_activation_traceback_is_redacted(exc_info.value)
+    assert sandbox.stop_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_vercel_s3_mount_failure_discards_transformed_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    session = await vercel_module.VercelSandboxClient().create(
+        manifest=_vercel_s3_manifest(package_module, credentials=True),
+        options=vercel_module.VercelSandboxClientOptions(allow_s3_credential_exposure=True),
+    )
+    sandbox = cast(_FakeAsyncSandbox, session._inner._sandbox)
+    transformed_secret = "test%2Dsecret%2Dkey"
+    sandbox.command_results = {
+        "/usr/bin/test": [_FakeCommandFinished()],
+        "/usr/bin/rpm": [_FakeCommandFinished(stdout="1.21.0")],
+        "/usr/bin/mount-s3": [
+            _FakeCommandFinished(
+                stderr=f"provider echoed {transformed_secret}",
+                exit_code=1,
+            )
+        ],
+        "/usr/bin/find": [_FakeCommandFinished()],
+    }
+
+    with pytest.raises(MountCommandError) as exc_info:
+        await session.start()
+
+    assert exc_info.value.context["stderr"] == "sandbox provider command failed"
+    assert exc_info.value.context["exit_code"] == 1
+    assert transformed_secret not in str(exc_info.value)
+    assert transformed_secret not in repr(exc_info.value.context)
+    assert sandbox.stop_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_vercel_s3_mount_failure_ignores_hostile_exception_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    session = await vercel_module.VercelSandboxClient().create(
+        manifest=_vercel_s3_manifest(package_module, credentials=True),
+        options=vercel_module.VercelSandboxClientOptions(allow_s3_credential_exposure=True),
+    )
+    sandbox = cast(_FakeAsyncSandbox, session._inner._sandbox)
+    sandbox.command_results = {
+        "/usr/bin/test": [_FakeCommandFinished()],
+        "/usr/bin/rpm": [_FakeCommandFinished(stdout="1.21.0")],
+        "/usr/bin/find": [_FakeCommandFinished()],
+    }
+
+    class HostileProviderError(_FakeVercelSandboxRateLimitError):
+        pass
+
+    _install_hostile_exception_descriptors(
+        HostileProviderError,
+        reject_stringification=True,
+    )
+    provider_error = HostileProviderError("provider returned test-secret-key")
+    original_run_command = sandbox.run_command
+
+    async def fail_command(
+        cmd: str,
+        args: list[str] | None = None,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        sudo: bool = False,
+    ) -> _FakeCommandFinished:
+        if cmd == "/usr/bin/mount-s3":
+            raise provider_error
+        return await original_run_command(cmd, args, cwd=cwd, env=env, sudo=sudo)
+
+    monkeypatch.setattr(sandbox, "run_command", fail_command)
+
+    with pytest.raises(MountCommandError) as exc_info:
+        await session.start()
+
+    assert type(exc_info.value) is MountCommandError
+    assert exc_info.value.context["stderr"] == "sandbox provider command failed"
+    assert exc_info.value.retryable is True
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    _assert_base_exception_slots_cleared(provider_error)
+    assert sandbox.stop_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_vercel_s3_shutdown_redacts_provider_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    session = await vercel_module.VercelSandboxClient().create(
+        manifest=_vercel_s3_manifest(package_module, credentials=True),
+        options=vercel_module.VercelSandboxClientOptions(allow_s3_credential_exposure=True),
+    )
+    sandbox = cast(_FakeAsyncSandbox, session._inner._sandbox)
+    _queue_successful_s3_mounts(sandbox)
+    await session.start()
+    provider_error = RuntimeError("provider cleanup failed with test-secret-key")
+    original_run_command = sandbox.run_command
+
+    async def fail_findmnt(
+        cmd: str,
+        args: list[str] | None = None,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        sudo: bool = False,
+    ) -> _FakeCommandFinished:
+        if cmd == "/usr/bin/findmnt":
+            raise provider_error
+        return await original_run_command(cmd, args, cwd=cwd, env=env, sudo=sudo)
+
+    monkeypatch.setattr(sandbox, "run_command", fail_findmnt)
+
+    with pytest.raises(MountCommandError) as exc_info:
+        await session.shutdown()
+
+    assert "test-secret-key" not in str(exc_info.value)
+    assert "test-secret-key" not in repr(exc_info.value.context)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    _assert_base_exception_slots_cleared(provider_error)
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert "test-secret-key" not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
     assert sandbox.stop_calls == 1
 
 
@@ -1958,6 +2361,66 @@ async def test_vercel_s3_mount_cancellation_redacts_full_activation_traceback(
             for secret in secrets:
                 assert secret not in locals_repr
         traceback = traceback.tb_next
+    assert sandbox.stop_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancellation_source", ["run_command", "stdout"])
+async def test_vercel_s3_mount_cancellation_ignores_hostile_exception_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+    cancellation_source: Literal["run_command", "stdout"],
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    session = await vercel_module.VercelSandboxClient().create(
+        manifest=_vercel_s3_manifest(package_module, credentials=True),
+        options=vercel_module.VercelSandboxClientOptions(allow_s3_credential_exposure=True),
+    )
+    sandbox = cast(_FakeAsyncSandbox, session._inner._sandbox)
+    sandbox.command_results = {
+        "/usr/bin/test": [_FakeCommandFinished()],
+        "/usr/bin/rpm": [_FakeCommandFinished(stdout="1.21.0")],
+        "/usr/bin/find": [_FakeCommandFinished()],
+    }
+
+    class HostileCancelledError(asyncio.CancelledError):
+        pass
+
+    _install_hostile_exception_descriptors(
+        HostileCancelledError,
+        reject_stringification=True,
+    )
+    provider_error = HostileCancelledError("provider cancelled with test-secret-key")
+    original_run_command = sandbox.run_command
+
+    class CancelledOutput(_FakeCommandFinished):
+        async def stdout(self) -> str:
+            raise provider_error
+
+    async def cancel_command(
+        cmd: str,
+        args: list[str] | None = None,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        sudo: bool = False,
+    ) -> _FakeCommandFinished:
+        if cmd == "/usr/bin/mount-s3":
+            raise provider_error
+        return await original_run_command(cmd, args, cwd=cwd, env=env, sudo=sudo)
+
+    if cancellation_source == "run_command":
+        monkeypatch.setattr(sandbox, "run_command", cancel_command)
+    else:
+        sandbox.command_results["/usr/bin/mount-s3"] = [CancelledOutput()]
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await session.start()
+
+    assert type(exc_info.value) is asyncio.CancelledError
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    _assert_base_exception_slots_cleared(provider_error)
     assert sandbox.stop_calls == 1
 
 
@@ -3111,3 +3574,69 @@ async def test_vercel_snapshot_hydrate_replaces_and_stops_superseded_sandbox(
     assert session.state.sandbox_id == "vercel-sandbox-1"
     restored = await session.read(Path("restored.txt"))
     assert restored.read() == b"after"
+
+
+@pytest.mark.asyncio
+async def test_vercel_direct_persist_redacts_protected_mount_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    session = await vercel_module.VercelSandboxClient().create(
+        manifest=_vercel_s3_manifest(package_module, credentials=True),
+        options=vercel_module.VercelSandboxClientOptions(allow_s3_credential_exposure=True),
+    )
+    inner = cast(Any, session._inner)
+    sentinel = "direct-vercel-persist-secret"
+    source_error = RuntimeError(f"provider echoed {sentinel}")
+
+    async def run_operation(
+        _session: object,
+        operation: Callable[[], Any],
+        **_kwargs: object,
+    ) -> Any:
+        return await operation()
+
+    async def fail_persist() -> io.IOBase:
+        raise source_error
+
+    monkeypatch.setattr(vercel_module, "with_ephemeral_mounts_removed", run_operation)
+    monkeypatch.setattr(inner, "_persist_workspace_internal", fail_persist)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        await inner.persist_workspace()
+
+    assert sentinel not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None
+
+
+@pytest.mark.asyncio
+async def test_vercel_client_delete_propagates_redacted_shutdown_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    client = vercel_module.VercelSandboxClient()
+    session = await client.create(
+        manifest=_vercel_s3_manifest(package_module, credentials=True),
+        options=vercel_module.VercelSandboxClientOptions(allow_s3_credential_exposure=True),
+    )
+    sentinel = "vercel-delete-secret"
+    source_error = RuntimeError(f"provider echoed {sentinel}")
+
+    async def fail_shutdown() -> None:
+        raise source_error
+
+    monkeypatch.setattr(session._inner, "shutdown", fail_shutdown)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        await client.delete(session)
+
+    assert sentinel not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None

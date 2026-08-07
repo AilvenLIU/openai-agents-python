@@ -28,6 +28,11 @@ import httpx
 from pydantic import TypeAdapter, field_serializer, field_validator
 from vercel import sandbox as vercel_sandbox
 
+from ....sandbox._mount_security import (
+    _mark_mount_error_for_manifest,
+    _mark_mount_validation_error,
+    redact_mount_error_data,
+)
 from ....sandbox.entries import BaseEntry, Dir, S3Mount, resolve_workspace_path
 from ....sandbox.errors import (
     ConfigurationError,
@@ -49,7 +54,10 @@ from ....sandbox.session import SandboxSession, SandboxSessionState, manifest_op
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
-from ....sandbox.session.mount_lifecycle import with_ephemeral_mounts_removed
+from ....sandbox.session.mount_lifecycle import (
+    current_task_owns_mount_transition,
+    with_ephemeral_mounts_removed,
+)
 from ....sandbox.session.runtime_helpers import RESOLVE_WORKSPACE_PATH_HELPER, RuntimeHelperScript
 from ....sandbox.session.sandbox_client import BaseSandboxClient, BaseSandboxClientOptions
 from ....sandbox.snapshot import SnapshotBase, SnapshotSpec, resolve_snapshot
@@ -328,18 +336,6 @@ def _manifest_without_vercel_s3_credentials(manifest: Manifest) -> Manifest:
     return sanitized
 
 
-def _manifest_has_vercel_s3_credentials(manifest: Manifest) -> bool:
-    return any(
-        credential is not None
-        for mount in _vercel_s3_mounts(manifest)
-        for credential in (
-            mount.access_key_id,
-            mount.secret_access_key,
-            mount.session_token,
-        )
-    )
-
-
 class VercelSandboxClientOptions(BaseSandboxClientOptions):
     """Client options for the Vercel sandbox backend."""
 
@@ -579,6 +575,21 @@ class VercelSandboxSession(BaseSandboxSession):
         credentials = self._trusted_s3_mount_credentials.get(key)
         return credentials is not None and credentials[0] is not None
 
+    def _runtime_has_protected_mount_authority(self) -> bool:
+        return any(
+            credential is not None
+            for credentials in self._trusted_s3_mount_credentials.values()
+            for credential in credentials
+        )
+
+    def _runtime_s3_mount_sensitive_values(self) -> tuple[str, ...]:
+        return tuple(
+            credential
+            for credentials in self._trusted_s3_mount_credentials.values()
+            for credential in credentials
+            if credential is not None
+        )
+
     def _runtime_s3_mount_environment(self, path: Path) -> dict[str, str]:
         key = self._s3_mount_path_key(path)
         credentials = self._trusted_s3_mount_credentials.get(key)
@@ -652,7 +663,9 @@ class VercelSandboxSession(BaseSandboxSession):
 
         current_task = asyncio.current_task()
         assert current_task is not None
-        if self._s3_mount_operation_owner is current_task:
+        if self._s3_mount_operation_owner is current_task or current_task_owns_mount_transition(
+            self
+        ):
             yield
             return
 
@@ -734,18 +747,30 @@ class VercelSandboxSession(BaseSandboxSession):
             provision_accounts=provision_accounts,
         )
 
-    async def _validate_manifest_application(self, *, only_ephemeral: bool = False) -> None:
+    async def _validate_manifest_application(
+        self,
+        *,
+        only_ephemeral: bool = False,
+        manifest: Manifest | None = None,
+    ) -> None:
+        await super()._validate_manifest_application(
+            only_ephemeral=only_ephemeral,
+            manifest=manifest,
+        )
         _ = only_ephemeral
+        validated_manifest = manifest or self.state.manifest
         if not self._runtime_s3_mount_activation_allowed() and (
-            self._trusted_s3_mounts or _vercel_s3_mounts(self.state.manifest)
+            self._trusted_s3_mounts or _vercel_s3_mounts(validated_manifest)
         ):
-            raise MountConfigError(
+            error = MountConfigError(
                 message=(
                     "Vercel S3 mount topology is fixed when the sandbox is created; "
                     "dynamic manifest application is not supported"
                 ),
                 context={"backend": "vercel"},
             )
+            _mark_mount_validation_error(error)
+            raise error
 
     def supports_pty(self) -> bool:
         return False
@@ -921,6 +946,7 @@ class VercelSandboxSession(BaseSandboxSession):
             return False
         return bool(sandbox.status == SandboxStatus.RUNNING)
 
+    @redact_mount_error_data
     async def shutdown(self) -> None:
         async with self._s3_mount_operation(validate_topology=False):
             if self._s3_mount_session_closed:
@@ -947,9 +973,21 @@ class VercelSandboxSession(BaseSandboxSession):
                         first_error = exc
         try:
             await self._stop_attached_sandbox()
-        except (Exception, asyncio.CancelledError) as exc:
+        except asyncio.CancelledError as exc:
             if self._detached_s3_mount_paths:
                 await self._runtime_fail_s3_mount_transition(exc)
+            raise
+        except Exception as exc:
+            if self._detached_s3_mount_paths:
+                try:
+                    await self._runtime_fail_s3_mount_transition(exc)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if first_error is None:
+                        raise
+            if first_error is not None:
+                raise first_error from None
             raise
         self._active_s3_mount_paths.clear()
         self._detached_s3_mount_paths.clear()
@@ -1101,6 +1139,7 @@ class VercelSandboxSession(BaseSandboxSession):
                 retryable=_vercel_provider_retryability(exc),
             ) from exc
 
+    @redact_mount_error_data
     async def persist_workspace(self) -> io.IOBase:
         async with self._s3_mount_operation(validate_topology=False):
             self._runtime_assert_s3_mount_topology()
@@ -1180,6 +1219,7 @@ class VercelSandboxSession(BaseSandboxSession):
             except Exception:
                 pass
 
+    @redact_mount_error_data
     async def hydrate_workspace(self, data: io.IOBase) -> None:
         async with self._s3_mount_operation(validate_topology=False):
             self._runtime_assert_s3_mount_topology()
@@ -1343,6 +1383,7 @@ class VercelSandboxClient(BaseSandboxClient[VercelSandboxClientOptions]):
             dependencies=self._resolve_dependencies(),
         )
 
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -1351,21 +1392,21 @@ class VercelSandboxClient(BaseSandboxClient[VercelSandboxClientOptions]):
         options: VercelSandboxClientOptions,
     ) -> SandboxSession:
         resolved_manifest = _resolve_manifest_root(manifest)
-        if (
-            _manifest_has_vercel_s3_credentials(resolved_manifest)
-            and not options.allow_s3_credential_exposure
-        ):
-            raise MountConfigError(
-                message=(
-                    "Vercel S3 mounts expose inline credentials to code running in the sandbox; "
-                    "set allow_s3_credential_exposure=True only for credentials scoped to that "
-                    "sandbox"
+        try:
+            self._validate_manifest_for_create(
+                resolved_manifest,
+                allowed_in_container_credential_strategy_types=(
+                    frozenset({"vercel_cloud_bucket"})
+                    if options.allow_s3_credential_exposure
+                    else frozenset()
                 ),
-                context={"backend": "vercel"},
             )
-        trusted_s3_mounts = _vercel_s3_mount_map(resolved_manifest)
-        for mount in trusted_s3_mounts.values():
-            mount.mount_strategy.validate_mount(mount)
+            trusted_s3_mounts = _vercel_s3_mount_map(resolved_manifest)
+            for mount in trusted_s3_mounts.values():
+                mount.mount_strategy.validate_mount(mount)
+        except MountConfigError as error:
+            _mark_mount_error_for_manifest(error, resolved_manifest)
+            raise
         state_manifest = _manifest_without_vercel_s3_credentials(resolved_manifest)
         resolved_token = self._token
         resolved_project_id = options.project_id or self._project_id
@@ -1403,16 +1444,15 @@ class VercelSandboxClient(BaseSandboxClient[VercelSandboxClientOptions]):
         await inner._ensure_sandbox()
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
+    @redact_mount_error_data
     async def delete(self, session: SandboxSession) -> SandboxSession:
         inner = session._inner
         if not isinstance(inner, VercelSandboxSession):
             raise TypeError("VercelSandboxClient.delete expects a VercelSandboxSession")
-        try:
-            await inner.shutdown()
-        except Exception:
-            pass
+        await inner.shutdown()
         return session
 
+    @redact_mount_error_data
     async def resume(self, state: SandboxSessionState) -> SandboxSession:
         if not isinstance(state, VercelSandboxSessionState):
             raise TypeError("VercelSandboxClient.resume expects a VercelSandboxSessionState")

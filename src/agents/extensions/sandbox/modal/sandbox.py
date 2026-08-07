@@ -34,6 +34,7 @@ from modal.config import config as modal_config
 from modal.container_process import ContainerProcess
 
 from ....logger import log_tool_action_warning
+from ....sandbox._mount_security import redact_mount_error_data
 from ....sandbox.config import DEFAULT_PYTHON_SANDBOX_IMAGE
 from ....sandbox.entries import Mount
 from ....sandbox.errors import (
@@ -1246,6 +1247,7 @@ class ModalSandboxSession(BaseSandboxSession):
         except Exception:
             return False
 
+    @redact_mount_error_data
     async def persist_workspace(self) -> io.IOBase:
         if self.state.workspace_persistence == _WORKSPACE_PERSISTENCE_SNAPSHOT_FILESYSTEM:
             return await self._persist_workspace_via_snapshot_filesystem()
@@ -1253,6 +1255,7 @@ class ModalSandboxSession(BaseSandboxSession):
             return await self._persist_workspace_via_snapshot_directory()
         return await self._persist_workspace_via_tar()
 
+    @redact_mount_error_data
     async def hydrate_workspace(self, data: io.IOBase) -> None:
         if self.state.workspace_persistence == _WORKSPACE_PERSISTENCE_SNAPSHOT_FILESYSTEM:
             return await self._hydrate_workspace_via_snapshot_filesystem(data)
@@ -1978,6 +1981,7 @@ class ModalSandboxClient(BaseSandboxClient[ModalSandboxClientOptions]):
                     },
                 )
 
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -2005,6 +2009,7 @@ class ModalSandboxClient(BaseSandboxClient[ModalSandboxClientOptions]):
         if options is None:
             raise ValueError("ModalSandboxClient.create requires options with app_name")
         manifest = manifest if manifest is not None else Manifest()
+        self._validate_manifest_for_create(manifest)
         app_name = options.app_name
         if not app_name:
             raise ValueError("ModalSandboxClient.create requires a valid app_name")
@@ -2173,6 +2178,7 @@ class ModalSandboxClient(BaseSandboxClient[ModalSandboxClientOptions]):
 
         return session
 
+    @redact_mount_error_data
     async def resume(
         self,
         state: SandboxSessionState,
