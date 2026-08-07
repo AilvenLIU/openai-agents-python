@@ -58,7 +58,7 @@ from ...tool import Tool
 from ...tracing import generation_span
 from ...tracing.span_data import GenerationSpanData
 from ...tracing.spans import Span
-from ...usage import Usage, _cache_write_tokens, _make_input_tokens_details
+from ...usage import Usage, _cache_write_tokens, _make_input_tokens_details, _raw_usage_snapshot
 from ...util._error_tracing import model_span_errors
 from ...util._json import _to_dump_compatible
 
@@ -359,6 +359,11 @@ class LitellmModel(Model):
                 output=items,
                 usage=usage,
                 response_id=None,
+                raw_usage=(
+                    _raw_usage_snapshot(getattr(response, "usage", None))
+                    if model_settings.preserve_raw_usage is True
+                    else None
+                ),
             )
 
     def _attach_logprobs_to_output(self, output_items: list[Any], logprobs: list[Any]) -> None:
@@ -417,9 +422,15 @@ class LitellmModel(Model):
             final_response: Response | None = None
             close_stream_in_background = False
             yielded_terminal_event = False
+            raw_usage_options: dict[str, Any] = (
+                {"preserve_raw_usage": True} if model_settings.preserve_raw_usage is True else {}
+            )
             try:
                 async for chunk in ChatCmplStreamHandler.handle_stream(
-                    response, stream, model=self.model
+                    response,
+                    stream,
+                    model=self.model,
+                    **raw_usage_options,
                 ):
                     if chunk.type == "response.completed":
                         final_response = chunk.response

@@ -29,6 +29,29 @@ print("Total tokens:", usage.total_tokens)
 
 Usage is aggregated across all model calls during the run (including tool calls and handoffs).
 
+### Preserving provider usage fields
+
+Normalized `Usage` values intentionally default missing counters to zero so they can be aggregated safely. If your application must distinguish a field omitted by the provider from a field explicitly reported as zero, opt in to the provider usage snapshot:
+
+```python
+agent = Agent(
+    name="Assistant",
+    model_settings=ModelSettings(preserve_raw_usage=True),
+)
+result = await Runner.run(agent, "Hello")
+
+raw_usage = result.raw_responses[-1].raw_usage
+if raw_usage is not None:
+    input_details = raw_usage.get("input_tokens_details")
+    cached_tokens_was_reported = (
+        isinstance(input_details, dict) and "cached_tokens" in input_details
+    )
+```
+
+`ModelResponse.raw_usage` is a JSON-compatible snapshot of the usage object received by the model adapter before the Agents SDK normalizes it. Omitted keys remain absent, while explicit zero and null values remain present. The snapshot reflects any transformations already performed by an upstream provider adapter; it is `None` when preservation is disabled or no usage payload reaches the Agents SDK.
+
+This option does not ask the provider to return usage. For streamed Chat Completions backends that require it, also set `include_usage=True`. Raw usage is retained only on completed model responses and is not persisted through `RunState` serialization.
+
 ### Enabling usage with third-party adapters
 
 Usage reporting varies across third-party adapters and provider backends. If you rely on adapter-backed models and need accurate `result.context_wrapper.usage` values:
