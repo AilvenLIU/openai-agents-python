@@ -98,6 +98,8 @@ class ModelRetryAdvice:
     replay_safety: str | None = None
     reason: str | None = None
     normalized: ModelRetryNormalizedError | None = None
+    response_started: bool = False
+    """Whether the provider had begun emitting the response when the failure occurred."""
 
 
 @dataclass
@@ -118,6 +120,13 @@ class RetryDecision:
     retry: bool
     delay: float | None = None
     reason: str | None = None
+    approve_unsafe_replay: bool = False
+    """Explicit application approval to replay a request the provider marked replay-unsafe.
+
+    This is deliberately separate from ``retry``: an ordinary ``RetryDecision(retry=True)``
+    never bypasses replay protection. Set this only for workloads where repeating
+    provider-side work that may already have happened is acceptable.
+    """
     _hard_veto: bool = field(default=False, init=False, repr=False, compare=False)
     _approves_replay: bool = field(default=False, init=False, repr=False, compare=False)
 
@@ -132,6 +141,26 @@ class RetryPolicyContext:
     stream: bool
     normalized: ModelRetryNormalizedError
     provider_advice: ModelRetryAdvice | None = None
+    previous_response_id: str | None = None
+    conversation_id: str | None = None
+
+    @property
+    def response_started(self) -> bool:
+        """Whether the provider had begun emitting the response when the failure occurred."""
+        return self.provider_advice is not None and self.provider_advice.response_started
+
+    @property
+    def replay_safety(self) -> str:
+        """Provider replay classification: ``"safe"``, ``"unsafe"`` or ``"unknown"``."""
+        if self.provider_advice is None:
+            return "unknown"
+        replay_safety = self.provider_advice.replay_safety
+        return replay_safety if replay_safety in {"safe", "unsafe"} else "unknown"
+
+    @property
+    def stateful_request(self) -> bool:
+        """Whether the request carried ``previous_response_id`` or ``conversation_id``."""
+        return bool(self.previous_response_id or self.conversation_id)
 
 
 RetryPolicy: TypeAlias = Callable[[RetryPolicyContext], MaybeAwaitable[bool | RetryDecision]]
@@ -216,6 +245,7 @@ def _merge_positive_retry_decisions(
         retry=True,
         delay=existing.delay,
         reason=existing.reason,
+        approve_unsafe_replay=existing.approve_unsafe_replay or incoming.approve_unsafe_replay,
     )
     if existing._approves_replay:
         merged = _with_replay_safe_approval(merged)
@@ -311,6 +341,8 @@ class _RetryPolicies:
                     merged.delay = decision.delay
                 if decision.reason is not None:
                     merged.reason = decision.reason
+                if decision.approve_unsafe_replay:
+                    merged.approve_unsafe_replay = True
                 if decision._approves_replay:
                     merged = _with_replay_safe_approval(merged)
 

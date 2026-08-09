@@ -2466,3 +2466,282 @@ async def test_stream_response_with_retry_closes_current_stream_when_consumer_st
     await outer_stream.aclose()
 
     assert stream.close_calls == 1
+
+
+def _ws_response_started_advice(request: ModelRetryAdviceRequest) -> ModelRetryAdvice:
+    """Advice matching the Responses WebSocket adapter after a response-started disconnect."""
+    return ModelRetryAdvice(
+        suggested=False,
+        replay_safety="unsafe",
+        reason=str(request.error),
+        response_started=True,
+    )
+
+
+def test_retry_policy_context_normalizes_unknown_provider_replay_safety() -> None:
+    context = RetryPolicyContext(
+        error=_connection_error(),
+        attempt=1,
+        max_retries=1,
+        stream=False,
+        normalized=ModelRetryNormalizedError(),
+        provider_advice=ModelRetryAdvice(replay_safety="conditional"),
+    )
+
+    assert context.replay_safety == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_provider_unsafe_replay_retries_when_policy_approves_explicitly() -> None:
+    calls = 0
+    seen: list[RetryPolicyContext] = []
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _connection_error("no close frame received or sent")
+        return ModelResponse(output=[get_text_message("ok")], usage=Usage(), response_id="resp")
+
+    def policy(context: RetryPolicyContext) -> RetryDecision:
+        seen.append(context)
+        return RetryDecision(
+            retry=True,
+            approve_unsafe_replay=True,
+            reason="Approved one replay of a read-only model turn",
+        )
+
+    result = await get_response_with_retry(
+        get_response=get_response,
+        rewind=lambda: asyncio.sleep(0),
+        retry_settings=ModelRetrySettings(
+            max_retries=1, backoff={"initial_delay": 0}, policy=policy
+        ),
+        get_retry_advice=_ws_response_started_advice,
+        previous_response_id=None,
+        conversation_id=None,
+    )
+
+    assert result.response_id == "resp"
+    assert calls == 2
+    # The policy must be able to scope its approval, so it needs the structured context.
+    assert len(seen) == 1
+    assert seen[0].stream is False
+    assert seen[0].response_started is True
+    assert seen[0].replay_safety == "unsafe"
+    assert seen[0].stateful_request is False
+
+
+@pytest.mark.asyncio
+async def test_provider_unsafe_replay_still_blocks_an_ordinary_retry_decision() -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise _connection_error("no close frame received or sent")
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        # No `approve_unsafe_replay`, so this must not bypass replay protection.
+        return RetryDecision(retry=True)
+
+    with pytest.raises(APIConnectionError):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1, backoff={"initial_delay": 0}, policy=policy
+            ),
+            get_retry_advice=_ws_response_started_advice,
+            previous_response_id=None,
+            conversation_id=None,
+        )
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_unsafe_replay_approval_is_ignored_for_streamed_requests() -> None:
+    calls = 0
+
+    async def get_stream() -> AsyncIterator[TResponseStreamEvent]:
+        nonlocal calls
+        calls += 1
+        raise _connection_error("no close frame received or sent")
+        yield  # pragma: no cover - generator marker
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        return RetryDecision(retry=True, approve_unsafe_replay=True)
+
+    with pytest.raises(APIConnectionError):
+        async for _event in stream_response_with_retry(
+            get_stream=get_stream,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1, backoff={"initial_delay": 0}, policy=policy
+            ),
+            get_retry_advice=_ws_response_started_advice,
+            previous_response_id=None,
+            conversation_id=None,
+        ):
+            pass
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unsafe_replay_approval_does_not_replay_programmatic_tool_calling() -> None:
+    calls = 0
+    policy_calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise _connection_error()
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        nonlocal policy_calls
+        policy_calls += 1
+        return RetryDecision(retry=True, approve_unsafe_replay=True)
+
+    # `replay_unsafe_request` is the request-level veto the runner sets for
+    # Programmatic Tool Calling. Application approval must not lift it.
+    with pytest.raises(APIConnectionError):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1, backoff={"initial_delay": 0}, policy=policy
+            ),
+            get_retry_advice=_ws_response_started_advice,
+            previous_response_id=None,
+            conversation_id=None,
+            replay_unsafe_request=True,
+        )
+
+    assert calls == 1
+    assert policy_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("combinator", ["all", "any"])
+async def test_unsafe_replay_approval_survives_policy_combinators(combinator: str) -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _connection_error("no close frame received or sent")
+        return ModelResponse(output=[get_text_message("ok")], usage=Usage(), response_id="resp")
+
+    def approving(_context: RetryPolicyContext) -> RetryDecision:
+        return RetryDecision(retry=True, approve_unsafe_replay=True)
+
+    def plain(_context: RetryPolicyContext) -> RetryDecision:
+        return RetryDecision(retry=True)
+
+    combined = getattr(retry_policies, combinator)(approving, plain)
+
+    result = await get_response_with_retry(
+        get_response=get_response,
+        rewind=lambda: asyncio.sleep(0),
+        retry_settings=ModelRetrySettings(
+            max_retries=1, backoff={"initial_delay": 0}, policy=combined
+        ),
+        get_retry_advice=_ws_response_started_advice,
+        previous_response_id=None,
+        conversation_id=None,
+    )
+
+    assert result.response_id == "resp"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_unsafe_replay_approval_applies_to_a_stateful_request() -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _connection_error("no close frame received or sent")
+        return ModelResponse(output=[get_text_message("ok")], usage=Usage(), response_id="resp")
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        return RetryDecision(retry=True, approve_unsafe_replay=True)
+
+    # `auto_previous_response_id=True` produces exactly this shape: a stateful request
+    # that fails closed by default but carries no application-local side effects.
+    result = await get_response_with_retry(
+        get_response=get_response,
+        rewind=lambda: asyncio.sleep(0),
+        retry_settings=ModelRetrySettings(
+            max_retries=1, backoff={"initial_delay": 0}, policy=policy
+        ),
+        get_retry_advice=_ws_response_started_advice,
+        previous_response_id="resp_1",
+        conversation_id=None,
+    )
+
+    assert result.response_id == "resp"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_stateful_request_still_fails_closed_without_explicit_approval() -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise _connection_error("no close frame received or sent")
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        return RetryDecision(retry=True)
+
+    with pytest.raises(APIConnectionError):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1, backoff={"initial_delay": 0}, policy=policy
+            ),
+            get_retry_advice=_ws_response_started_advice,
+            previous_response_id=None,
+            conversation_id="conv_1",
+        )
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unsafe_replay_approval_does_not_lift_a_stateful_request_with_unknown_safety() -> (
+    None
+):
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise _connection_error()
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        return RetryDecision(retry=True, approve_unsafe_replay=True)
+
+    # No provider advice, so replay safety is unknown rather than unsafe. The approval is
+    # scoped to provider-marked unsafe failures, so the stateful gate must stay closed.
+    with pytest.raises(APIConnectionError):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1, backoff={"initial_delay": 0}, policy=policy
+            ),
+            get_retry_advice=lambda _request: None,
+            previous_response_id="resp_1",
+            conversation_id=None,
+        )
+
+    assert calls == 1
