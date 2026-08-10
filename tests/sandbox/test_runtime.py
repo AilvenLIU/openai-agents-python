@@ -739,7 +739,7 @@ async def test_sandbox_session_rejects_unsafe_manifest_before_workspace_persiste
     )
     session = SandboxSession(inner)
 
-    with pytest.raises(MountConfigError, match="mount-scoped credentials cannot be exposed") as exc:
+    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid") as exc:
         if operation == "persist":
             await session.persist_workspace()
         else:
@@ -4215,7 +4215,12 @@ async def test_session_manager_rejects_unsafe_stopped_injected_session_manifest(
     )
 
     manager.acquire_agent(agent)
-    with pytest.raises(MountConfigError, match="mount-scoped credentials cannot be exposed"):
+    expected_message = (
+        "sandbox mount configuration is invalid"
+        if authority_source == "current_manifest"
+        else "mount-scoped credentials cannot be exposed"
+    )
+    with pytest.raises(MountConfigError, match=expected_message):
         await manager.ensure_session(
             agent=agent,
             capabilities=capabilities,
@@ -4315,6 +4320,60 @@ async def test_session_manager_redacts_authority_added_before_capability_failure
         if "/src/agents/" in frame_path:
             assert sentinel not in repr(traceback.tb_frame.f_locals)
         traceback = traceback.tb_next
+
+
+@pytest.mark.parametrize(
+    ("authority_timing", "error_kind", "expected_type", "expected_args"),
+    [
+        ("existing", "system_exit", SystemExit, (1,)),
+        ("added", "keyboard_interrupt", KeyboardInterrupt, ()),
+    ],
+)
+def test_process_manifest_preserves_value_free_process_control_with_authority(
+    authority_timing: str,
+    error_kind: str,
+    expected_type: type[BaseException],
+    expected_args: tuple[object, ...],
+) -> None:
+    sentinel = f"process-manifest-{authority_timing}-{error_kind}-secret"
+    source_error: BaseException = (
+        SystemExit(sentinel) if error_kind == "system_exit" else KeyboardInterrupt(sentinel)
+    )
+
+    class ProcessControlCapability(Capability):
+        type: str = "process-control"
+
+        def process_manifest(self, manifest: Manifest) -> Manifest:
+            if authority_timing == "added":
+                manifest.entries["data"] = S3Mount(
+                    bucket="example-bucket",
+                    access_key_id="example-access-key",
+                    secret_access_key=sentinel,
+                    mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+                )
+            raise source_error
+
+    manifest = Manifest()
+    if authority_timing == "existing":
+        manifest.entries["data"] = S3Mount(
+            bucket="example-bucket",
+            access_key_id="example-access-key",
+            secret_access_key=sentinel,
+            mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+        )
+
+    with pytest.raises(expected_type) as exc_info:
+        SandboxRuntimeSessionManager._process_manifest(
+            [ProcessControlCapability()],
+            manifest,
+        )
+
+    assert type(exc_info.value) is expected_type
+    assert exc_info.value.args == expected_args
+    assert exc_info.value is not source_error
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -5476,7 +5535,7 @@ async def test_apply_manifest_rejects_mount_authority_before_materialization() -
         )
     )
 
-    with pytest.raises(MountConfigError, match="mount-scoped credentials cannot be exposed") as exc:
+    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid") as exc:
         await session.apply_manifest()
 
     assert session.materialize_calls == 0
@@ -5503,7 +5562,7 @@ async def test_start_workspace_rejects_mount_authority_before_materialization() 
         )
     )
 
-    with pytest.raises(MountConfigError, match="mount-scoped credentials cannot be exposed"):
+    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid"):
         await BaseSandboxSession.start(session)
 
     assert session.materialize_calls == 0
@@ -5583,7 +5642,7 @@ async def test_session_stop_rejects_mutated_unsafe_mount_before_snapshot_work() 
         )
     )
 
-    with pytest.raises(MountConfigError, match="mount-scoped credentials cannot be exposed"):
+    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid"):
         await BaseSandboxSession.stop(session)
 
     assert session.persist_calls == 0

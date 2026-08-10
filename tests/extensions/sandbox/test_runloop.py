@@ -2110,7 +2110,9 @@ class TestRunloopSandbox:
             resume_calls_before = devbox.resume_calls
             snapshot_calls_before = len(devbox.snapshot_calls)
 
-            with pytest.raises(MountConfigError) as exc:
+            with pytest.raises(
+                MountConfigError, match="sandbox mount configuration is invalid"
+            ) as exc:
                 await session.start()
 
         assert len(devbox.exec_calls) == exec_calls_before

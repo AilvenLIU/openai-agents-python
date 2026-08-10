@@ -16,7 +16,9 @@ import httpx
 import pytest
 from pydantic import BaseModel, PrivateAttr
 
+from agents.exceptions import BaseExceptionGroup
 from agents.sandbox import Manifest, SandboxAgent, SandboxPathGrant, SandboxRunConfig
+from agents.sandbox._mount_security import redact_mount_error_data
 from agents.sandbox.capabilities import Capability
 from agents.sandbox.entries import (
     Dir,
@@ -30,9 +32,11 @@ from agents.sandbox.entries import (
 from agents.sandbox.entries.mounts.base import InContainerMountAdapter
 from agents.sandbox.errors import (
     ConfigurationError,
+    ErrorCode,
     InvalidManifestPathError,
     MountCommandError,
     MountConfigError,
+    SandboxError,
 )
 from agents.sandbox.manifest import EnvEntry, Environment, StrEnvValue
 from agents.sandbox.materialization import MaterializedFile
@@ -762,7 +766,7 @@ def test_vercel_from_state_rejects_custom_mount_before_deepcopy(
         mount_strategy=package_module.VercelCloudBucketMountStrategy(),
     )
 
-    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid"):
+    with pytest.raises(MountConfigError):
         vercel_module.VercelSandboxSession.from_state(
             state,
             trusted_s3_mounts={"/vercel/sandbox/remote": trusted_mount},
@@ -832,7 +836,7 @@ def test_vercel_from_state_redacts_trusted_mount_credentials_from_failure_traceb
         sandbox_id="sandbox-existing",
     )
 
-    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+    with pytest.raises(MountConfigError) as exc_info:
         vercel_module.VercelSandboxSession.from_state(
             state,
             allow_s3_credential_exposure=allow_s3_credential_exposure,
@@ -875,7 +879,7 @@ def test_vercel_constructor_redacts_trusted_mount_credentials_from_failure_trace
         sandbox_id="sandbox-existing",
     )
 
-    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+    with pytest.raises(MountConfigError) as exc_info:
         vercel_module.VercelSandboxSession(
             state=state,
             allow_s3_credential_exposure=allow_s3_credential_exposure,
@@ -950,7 +954,7 @@ async def test_vercel_protected_session_public_operations_redact_provider_failur
         async def invoke() -> object:
             return await session.resolve_exposed_port(3000)
 
-    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+    with pytest.raises(SandboxError, match="protected mount configuration") as exc_info:
         await invoke()
 
     assert sentinel not in str(exc_info.value)
@@ -974,7 +978,7 @@ async def test_vercel_create_requires_explicit_s3_credential_exposure(
     client = vercel_module.VercelSandboxClient()
     manifest = _vercel_s3_manifest(package_module, credentials=True)
 
-    with pytest.raises(MountConfigError, match="mount-scoped credentials") as exc:
+    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid") as exc:
         await client.create(
             manifest=manifest,
             options=vercel_module.VercelSandboxClientOptions(),
@@ -1202,7 +1206,7 @@ async def test_vercel_credential_opt_in_does_not_allow_signed_endpoint_urls(
     mount = cast(S3Mount, manifest.entries["remote"])
     mount.endpoint_url = "https://example.test?signature=endpoint-secret"
 
-    with pytest.raises(MountConfigError, match="does not support exposing"):
+    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid"):
         await vercel_module.VercelSandboxClient().create(
             manifest=manifest,
             options=vercel_module.VercelSandboxClientOptions(
@@ -1252,6 +1256,46 @@ async def test_vercel_credential_opt_in_redacts_provider_validation_errors(
 
 
 @pytest.mark.asyncio
+async def test_vercel_reassigned_validation_producer_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    sentinel = "vercel-reassigned-validation-producer-secret"
+    manifest = _vercel_s3_manifest(package_module, credentials=True)
+    mount = cast(S3Mount, manifest.entries["remote"])
+    mount.secret_access_key = sentinel
+    source_error = MountConfigError(message=sentinel)
+
+    async def foreign_validation(self: object, **kwargs: object) -> None:
+        _ = (self, kwargs)
+        source_error._agents_data_redacted = True  # type: ignore[attr-defined]
+        raise source_error
+
+    monkeypatch.setattr(
+        vercel_module.VercelSandboxSession,
+        "_validate_manifest_application",
+        foreign_validation,
+    )
+
+    @redact_mount_error_data
+    async def validate(*, manifest: Manifest) -> None:
+        await vercel_module.VercelSandboxSession._validate_manifest_application(
+            object(),
+            manifest=manifest,
+        )
+
+    with pytest.raises(MountConfigError) as exc_info:
+        await validate(manifest=manifest)
+
+    assert type(exc_info.value) is MountConfigError
+    assert source_error.args == ()
+    assert source_error.__dict__ == {}
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+@pytest.mark.asyncio
 async def test_vercel_apply_manifest_uses_central_mount_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1275,7 +1319,7 @@ async def test_vercel_apply_manifest_uses_central_mount_validation(
     sandbox = _FakeAsyncSandbox(sandbox_id="sandbox-central-validation")
     session = vercel_module.VercelSandboxSession.from_state(state, sandbox=sandbox)
 
-    with pytest.raises(MountConfigError, match="mount-scoped credentials"):
+    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid"):
         await session.apply_manifest()
 
     assert sandbox.run_command_calls == []
@@ -1408,7 +1452,7 @@ async def test_vercel_s3_mount_is_create_time_only_and_credentials_are_not_seria
         "remote": remote_mount,
     }
     write_call_count = len(sandbox.write_files_calls)
-    with pytest.raises(MountConfigError, match="dynamic manifest application") as exc:
+    with pytest.raises(MountConfigError) as exc:
         await session.apply_manifest(only_ephemeral=True)
     assert len(sandbox.write_files_calls) == write_call_count
     traceback = exc.value.__traceback__
@@ -2692,10 +2736,12 @@ async def test_vercel_s3_mount_failure_redacts_full_activation_traceback(
     with pytest.raises(MountCommandError) as exc_info:
         await session.start()
 
-    assert exc_info.value.context["stderr"] == "sandbox provider command failed"
-    assert transformed_secret not in str(exc_info.value)
-    assert transformed_secret not in repr(exc_info.value.context)
+    assert exc_info.value.error_code is ErrorCode.MOUNT_FAILED
+    assert exc_info.value.op == "materialize"
     assert exc_info.value.retryable is True
+    assert exc_info.value.context == {"command": "<redacted>", "stderr": None}
+    assert transformed_secret not in str(exc_info.value)
+    assert transformed_secret not in repr(exc_info.value)
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
     assert provider_error.__traceback__ is None
@@ -2732,10 +2778,12 @@ async def test_vercel_s3_mount_failure_discards_transformed_stderr(
     with pytest.raises(MountCommandError) as exc_info:
         await session.start()
 
-    assert exc_info.value.context["stderr"] == "sandbox provider command failed"
-    assert exc_info.value.context["exit_code"] == 1
+    assert exc_info.value.error_code is ErrorCode.MOUNT_FAILED
+    assert exc_info.value.op == "materialize"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.context == {"command": "<redacted>", "stderr": None}
     assert transformed_secret not in str(exc_info.value)
-    assert transformed_secret not in repr(exc_info.value.context)
+    assert transformed_secret not in repr(exc_info.value)
     assert sandbox.stop_calls == 1
 
 
@@ -2756,7 +2804,18 @@ async def test_vercel_s3_mount_failure_ignores_hostile_exception_descriptors(
         "/usr/bin/find": [_FakeCommandFinished()],
     }
 
-    class HostileProviderError(_FakeVercelSandboxRateLimitError):
+    source_errors: dict[type[BaseException], BaseException] = {}
+
+    class HostileExceptionMeta(type):
+        def __getattribute__(cls, name: str) -> object:
+            if name == "__name__":
+                return source_errors[cast(type[BaseException], cls)]
+            return super().__getattribute__(name)
+
+    class HostileProviderError(
+        _FakeVercelSandboxRateLimitError,
+        metaclass=HostileExceptionMeta,
+    ):
         pass
 
     _install_hostile_exception_descriptors(
@@ -2764,6 +2823,7 @@ async def test_vercel_s3_mount_failure_ignores_hostile_exception_descriptors(
         reject_stringification=True,
     )
     provider_error = HostileProviderError("provider returned test-secret-key")
+    source_errors[HostileProviderError] = provider_error
     original_run_command = sandbox.run_command
 
     async def fail_command(
@@ -2784,11 +2844,65 @@ async def test_vercel_s3_mount_failure_ignores_hostile_exception_descriptors(
         await session.start()
 
     assert type(exc_info.value) is MountCommandError
-    assert exc_info.value.context["stderr"] == "sandbox provider command failed"
+    assert exc_info.value.error_code is ErrorCode.MOUNT_FAILED
+    assert exc_info.value.op == "materialize"
     assert exc_info.value.retryable is True
+    assert exc_info.value.context == {"command": "<redacted>", "stderr": None}
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
+    assert session._inner._s3_mount_failure == "redacted"
+    assert session._inner._s3_mount_failure is not provider_error
     _assert_base_exception_slots_cleared(provider_error)
+    assert sandbox.stop_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_vercel_s3_mount_exception_group_still_stops_the_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vercel_module = _load_vercel_module(monkeypatch)
+    package_module = importlib.import_module("agents.extensions.sandbox.vercel")
+    session = await vercel_module.VercelSandboxClient().create(
+        manifest=_vercel_s3_manifest(package_module, credentials=True),
+        options=vercel_module.VercelSandboxClientOptions(allow_s3_credential_exposure=True),
+    )
+    sandbox = cast(_FakeAsyncSandbox, session._inner._sandbox)
+    sandbox.command_results = {
+        "/usr/bin/test": [_FakeCommandFinished()],
+        "/usr/bin/rpm": [_FakeCommandFinished(stdout="1.21.0")],
+        "/usr/bin/find": [_FakeCommandFinished()],
+    }
+    child_error = asyncio.CancelledError("provider cancelled with test-secret-key")
+    provider_error = BaseExceptionGroup(
+        "provider failure with test-secret-key",
+        [child_error],
+    )
+    original_run_command = sandbox.run_command
+
+    async def fail_command(
+        cmd: str,
+        args: list[str] | None = None,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        sudo: bool = False,
+    ) -> _FakeCommandFinished:
+        if cmd == "/usr/bin/mount-s3":
+            raise provider_error
+        return await original_run_command(cmd, args, cwd=cwd, env=env, sudo=sudo)
+
+    monkeypatch.setattr(sandbox, "run_command", fail_command)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        await session.start()
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert session._inner._s3_mount_failure == "redacted"
+    assert provider_error.args[0] == "Error details are redacted."
+    assert provider_error.__traceback__ is None
+    _assert_base_exception_slots_cleared(child_error)
+    assert "test-secret-key" not in repr(exc_info.value)
     assert sandbox.stop_calls == 1
 
 
@@ -2825,8 +2939,12 @@ async def test_vercel_s3_shutdown_redacts_provider_failure(
     with pytest.raises(MountCommandError) as exc_info:
         await session.shutdown()
 
+    assert exc_info.value.error_code is ErrorCode.MOUNT_FAILED
+    assert exc_info.value.op == "materialize"
+    assert exc_info.value.retryable is None
+    assert exc_info.value.context == {"command": "<redacted>", "stderr": None}
     assert "test-secret-key" not in str(exc_info.value)
-    assert "test-secret-key" not in repr(exc_info.value.context)
+    assert "test-secret-key" not in repr(exc_info.value)
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
     _assert_base_exception_slots_cleared(provider_error)

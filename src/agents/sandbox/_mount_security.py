@@ -5,19 +5,19 @@ import copy
 import dataclasses
 import importlib
 import re
-import traceback
 from collections.abc import Callable, Collection, Coroutine, Iterable, Mapping
 from functools import wraps
 from pathlib import PurePath, PurePosixPath
-from typing import TYPE_CHECKING, Any, NoReturn, ParamSpec, TypeVar, cast
-from urllib.parse import urlsplit
+from typing import TYPE_CHECKING, Any, NoReturn, ParamSpec, TypeVar, cast, get_args
 
 from ..exceptions import (
-    _clear_data_redacted_error_traceback,
-    _detach_data_redacted_error_traceback,
+    BaseExceptionGroup,
+    _base_exception_instance_dict,
+    _discard_exception_graph,
     _is_error_data_redacted,
     _mark_error_data_redacted,
     _raise_data_redacted_error,
+    _replace_data_redacted_process_control_error,
 )
 from .entries import (
     AzureBlobMount,
@@ -32,15 +32,27 @@ from .entries import (
     S3FilesMount,
     S3Mount,
 )
+from .entries.mounts._redaction import _url_contains_inline_authority
 from .entries.mounts.base import MountStrategyBase
 from .entries.mounts.patterns import (
+    FuseMountConfig,
     FuseMountPattern,
     MountPatternBase,
+    MountpointMountConfig,
     MountpointMountPattern,
+    RcloneMountConfig,
     RcloneMountPattern,
+    S3FilesMountConfig,
     S3FilesMountPattern,
 )
-from .errors import MountConfigError
+from .errors import (
+    ErrorCode,
+    MountCommandError,
+    MountConfigError,
+    MountToolMissingError,
+    OpName,
+    SandboxError,
+)
 
 if TYPE_CHECKING:
     from .manifest import Manifest
@@ -403,7 +415,7 @@ _IN_CONTAINER_MOUNT_CREDENTIAL_CAPABILITIES: tuple[_InContainerMountCredentialCa
 )
 _RCLONE_SAFE_FLAG_ARGS = frozenset({"allow-other"})
 _RCLONE_SAFE_VALUE_ARGS = frozenset({"buffer-size", "gid", "uid"})
-_SAFE_MOUNT_VALIDATION_MESSAGE_ATTR = "_agents_safe_mount_validation_message"
+_SANDBOX_ERROR_OPS = frozenset(get_args(OpName))
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
@@ -413,40 +425,83 @@ class _InvalidRawMountManifestError(ValueError):
     pass
 
 
+def _classify_mount_authority_for_boundary(
+    args: tuple[object, ...],
+    kwargs: Mapping[str, object],
+) -> tuple[bool, BaseException | None]:
+    try:
+        return _call_has_configured_mount_authority(args, kwargs), None
+    except BaseException as error:
+        return True, error
+
+
+def _replace_mount_classification_error(
+    error: BaseException,
+) -> BaseException:
+    return _replace_mount_operation_error(error)
+
+
+def _prepare_mount_boundary_failure(
+    error: BaseException,
+    *,
+    call_has_authority: bool,
+    args: tuple[object, ...],
+    kwargs: Mapping[str, object],
+    preserve_value_error_type: bool = False,
+) -> tuple[bool, BaseException | None]:
+    redacted_boundary_error = type(error) in {
+        RuntimeError,
+        asyncio.CancelledError,
+    } and _is_error_data_redacted(error)
+    failure_has_authority, classification_error = _classify_mount_authority_for_boundary(
+        args, kwargs
+    )
+    if classification_error is not None:
+        discard_mount_source_exception(error)
+        return False, _replace_mount_classification_error(classification_error)
+    if not (call_has_authority or failure_has_authority or redacted_boundary_error):
+        return True, None
+    if preserve_value_error_type and isinstance(error, ValueError):
+        discard_mount_source_exception(error)
+        safe_error = ValueError("sandbox mount validation failed")
+        _mark_error_data_redacted(safe_error)
+        return False, safe_error
+    return False, _replace_protected_mount_error(error)
+
+
 def redact_mount_error_data(
     function: Callable[_P, Coroutine[Any, Any, _T]],
 ) -> Callable[_P, Coroutine[Any, Any, _T]]:
-    """Replace marked validation failures after clearing payload-bearing async frames."""
+    """Replace failures after clearing async frames that handled mount authority."""
 
     @wraps(function)
     async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:
-        call_has_authority = _call_has_configured_mount_authority(args, kwargs)
-        safe_error: Exception | None = None
-        safe_cancel: asyncio.CancelledError | None = None
+        call_has_authority, classification_error = _classify_mount_authority_for_boundary(
+            args, kwargs
+        )
+        safe_error: BaseException | None = None
+        if classification_error is not None:
+            safe_error = _replace_mount_classification_error(classification_error)
+            del args, kwargs, call_has_authority, classification_error
+            _raise_data_redacted_error(safe_error)
         try:
             return await function(*args, **kwargs)
-        except asyncio.CancelledError as error:
-            if not call_has_authority:
-                raise
-            discard_mount_source_exception(error)
-            safe_cancel = asyncio.CancelledError()
-        except Exception as error:
-            if isinstance(error, MountConfigError) and _is_error_data_redacted(error):
-                safe_error = _replace_mount_error(error)
-            elif _is_error_data_redacted(error):
-                _clear_data_redacted_error_traceback(error)
-                _detach_data_redacted_error_traceback(error)
-                error.__cause__ = None
-                error.__context__ = None
-                safe_error = error
-            elif call_has_authority:
-                safe_error = _replace_mount_operation_error(error)
-            else:
+        except BaseException as error:
+            reraise_source, safe_error = _prepare_mount_boundary_failure(
+                error,
+                call_has_authority=call_has_authority,
+                args=args,
+                kwargs=kwargs,
+            )
+            if reraise_source:
                 raise
 
-        del args, kwargs, call_has_authority
-        if safe_cancel is not None:
-            raise safe_cancel from None
+        del (
+            args,
+            kwargs,
+            call_has_authority,
+            reraise_source,
+        )
         assert safe_error is not None
         _raise_data_redacted_error(safe_error)
 
@@ -458,33 +513,37 @@ def _redact_mount_error_data_sync(
     *,
     preserve_value_error_type: bool,
 ) -> Callable[_P, _T]:
-    """Replace validation failures after clearing payload-bearing sync frames."""
+    """Replace failures after clearing sync frames that handled mount authority."""
 
     @wraps(function)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:
-        call_has_authority = _call_has_configured_mount_authority(args, kwargs)
-        safe_error: Exception | None = None
+        call_has_authority, classification_error = _classify_mount_authority_for_boundary(
+            args, kwargs
+        )
+        safe_error: BaseException | None = None
+        if classification_error is not None:
+            safe_error = _replace_mount_classification_error(classification_error)
+            del args, kwargs, call_has_authority, classification_error
+            _raise_data_redacted_error(safe_error)
         try:
             return function(*args, **kwargs)
-        except Exception as error:
-            if isinstance(error, MountConfigError) and _is_error_data_redacted(error):
-                safe_error = _replace_mount_error(error)
-            elif _is_error_data_redacted(error):
-                _clear_data_redacted_error_traceback(error)
-                _detach_data_redacted_error_traceback(error)
-                error.__cause__ = None
-                error.__context__ = None
-                safe_error = error
-            elif preserve_value_error_type and call_has_authority and isinstance(error, ValueError):
-                discard_mount_source_exception(error)
-                safe_error = ValueError("sandbox mount validation failed")
-                _mark_error_data_redacted(safe_error)
-            elif call_has_authority:
-                safe_error = _replace_mount_operation_error(error)
-            else:
+        except BaseException as error:
+            reraise_source, safe_error = _prepare_mount_boundary_failure(
+                error,
+                call_has_authority=call_has_authority,
+                args=args,
+                kwargs=kwargs,
+                preserve_value_error_type=preserve_value_error_type,
+            )
+            if reraise_source:
                 raise
 
-        del args, kwargs, call_has_authority
+        del (
+            args,
+            kwargs,
+            call_has_authority,
+            reraise_source,
+        )
         assert safe_error is not None
         _raise_data_redacted_error(safe_error)
 
@@ -492,7 +551,7 @@ def _redact_mount_error_data_sync(
 
 
 def redact_mount_error_data_sync(function: Callable[_P, _T]) -> Callable[_P, _T]:
-    """Replace marked validation failures after clearing payload-bearing sync frames."""
+    """Replace failures after clearing sync frames that handled mount authority."""
 
     return _redact_mount_error_data_sync(function, preserve_value_error_type=False)
 
@@ -505,24 +564,85 @@ def redact_mount_validation_error_data_sync(
     return _redact_mount_error_data_sync(function, preserve_value_error_type=True)
 
 
+def _replace_protected_mount_error(error: BaseException) -> BaseException:
+    process_control_error = _replace_data_redacted_process_control_error(error)
+    if process_control_error is not None:
+        return process_control_error
+    structured_error = _replace_structured_sandbox_error(error)
+    if structured_error is not None:
+        return structured_error
+    return _replace_mount_operation_error(error)
+
+
 def _replace_mount_error(error: MountConfigError) -> MountConfigError:
-    message = (
-        error.message
-        if getattr(error, _SAFE_MOUNT_VALIDATION_MESSAGE_ATTR, False)
-        else "sandbox mount configuration is invalid"
-    )
-    safe_error = MountConfigError(message=message)
+    discard_mount_source_exception(error)
+    safe_error = MountConfigError(message="sandbox mount configuration is invalid")
     _mark_error_data_redacted(safe_error)
-    _clear_data_redacted_error_traceback(error)
-    _detach_data_redacted_error_traceback(error)
-    error.__cause__ = None
-    error.__context__ = None
-    error.args = ("Error details are redacted.",)
-    error.context = {}
     return safe_error
 
 
-def _replace_mount_operation_error(error: Exception) -> RuntimeError:
+def _replace_structured_sandbox_error(error: BaseException) -> SandboxError | None:
+    error_type = type(error)
+    if not issubclass(error_type, SandboxError):
+        return None
+    state = _base_exception_instance_dict(error)
+    if state is None:
+        return None
+    error_code = state.get("error_code")
+    op = state.get("op")
+    retryable = state.get("retryable")
+    if (
+        type(error_code) is not ErrorCode
+        or type(op) is not str
+        or op not in _SANDBOX_ERROR_OPS
+        or (retryable is not None and type(retryable) is not bool)
+    ):
+        return None
+
+    is_mount_config_error = error_type is MountConfigError
+    is_mount_command_error = error_type is MountCommandError
+    is_mount_tool_missing_error = error_type is MountToolMissingError
+    if is_mount_config_error and not (
+        error_code is ErrorCode.MOUNT_CONFIG_INVALID and op == "materialize" and retryable is False
+    ):
+        return None
+    if is_mount_command_error and not (
+        error_code is ErrorCode.MOUNT_FAILED and op == "materialize"
+    ):
+        return None
+    if is_mount_tool_missing_error and not (
+        error_code is ErrorCode.MOUNT_MISSING_TOOL and op == "materialize" and retryable is False
+    ):
+        return None
+
+    if is_mount_config_error:
+        return _replace_mount_error(cast(MountConfigError, error))
+
+    discard_mount_source_exception(error)
+    if is_mount_command_error:
+        safe_error: SandboxError = MountCommandError(
+            command="<redacted>",
+            stderr=None,
+            retryable=retryable,
+        )
+    elif is_mount_tool_missing_error:
+        safe_error = MountToolMissingError(tool="<redacted>")
+    else:
+        safe_error = SandboxError(
+            message="sandbox operation failed while using a protected mount configuration",
+            error_code=error_code,
+            op=cast(OpName, op),
+            context={},
+            retryable=retryable,
+        )
+    _mark_error_data_redacted(safe_error)
+    return safe_error
+
+
+def _replace_mount_operation_error(error: BaseException) -> BaseException:
+    process_control_error = _replace_data_redacted_process_control_error(error)
+    if process_control_error is not None:
+        return process_control_error
     discard_mount_source_exception(error)
     safe_error = RuntimeError(
         "sandbox operation failed while using a protected mount configuration"
@@ -533,67 +653,7 @@ def _replace_mount_operation_error(error: Exception) -> RuntimeError:
 
 def discard_mount_source_exception(error: BaseException) -> None:
     """Clear source frames without consulting provider-defined exception attributes."""
-
-    pending = [error]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-
-        linked: list[BaseException] = []
-        for descriptor in (
-            cast(Any, BaseException.__cause__),
-            cast(Any, BaseException.__context__),
-        ):
-            try:
-                candidate = descriptor.__get__(current, type(current))
-            except BaseException:
-                continue
-            if isinstance(candidate, BaseException):
-                linked.append(candidate)
-
-        try:
-            source_traceback = cast(Any, BaseException.__traceback__).__get__(
-                current, type(current)
-            )
-        except BaseException:
-            source_traceback = None
-        if source_traceback is not None:
-            try:
-                traceback.clear_frames(source_traceback)
-            except BaseException:
-                pass
-        try:
-            BaseException.__init__(current)
-        except BaseException:
-            pass
-        for descriptor, value in (
-            (cast(Any, BaseException.args), ()),
-            (cast(Any, BaseException.__traceback__), None),
-            (cast(Any, BaseException.__cause__), None),
-            (cast(Any, BaseException.__context__), None),
-        ):
-            try:
-                descriptor.__set__(current, value)
-            except BaseException:
-                pass
-        pending.extend(linked)
-
-
-def _url_contains_inline_authority(value: object) -> bool:
-    if value is None:
-        return False
-    if not isinstance(value, str):
-        return True
-    if "@" in value:
-        return True
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return True
-    return parsed.username is not None or parsed.password is not None or bool(parsed.query)
+    _discard_exception_graph(error)
 
 
 def _rclone_extra_args_analysis(
@@ -949,13 +1009,18 @@ def _mount_has_or_may_hide_configured_authority(mount: Mount) -> bool:
 def _call_has_configured_mount_authority(
     args: tuple[object, ...], kwargs: Mapping[str, object]
 ) -> bool:
-    """Inspect only SDK call-boundary manifest owners."""
+    """Inspect SDK-owned mount authority at a call boundary."""
 
     from .manifest import Manifest
 
     try:
         for value in (*args, *kwargs.values()):
+            if _mount_pattern_config_has_authority(value):
+                return True
             candidates = [value]
+            contained_mount = getattr(value, "_mount", None)
+            if isinstance(contained_mount, Mount):
+                candidates.append(contained_mount)
             state = getattr(value, "state", None)
             if state is not None:
                 candidates.append(state)
@@ -1004,8 +1069,31 @@ def _call_has_configured_mount_authority(
                     manifest
                 ):
                     return True
-    except Exception:
-        return True
+    except BaseExceptionGroup:
+        raise
+    except asyncio.CancelledError:
+        raise
+    return False
+
+
+def _mount_pattern_config_has_authority(value: object) -> bool:
+    if isinstance(value, FuseMountConfig):
+        return bool(
+            value.identity_client_id
+            or value.account_key
+            or _url_contains_inline_authority(value.endpoint)
+        )
+    if isinstance(value, MountpointMountConfig):
+        return bool(
+            value.access_key_id
+            or value.secret_access_key
+            or value.session_token
+            or _url_contains_inline_authority(value.endpoint_url)
+        )
+    if isinstance(value, RcloneMountConfig):
+        return bool(value.config_text)
+    if isinstance(value, S3FilesMountConfig):
+        return bool(value.extra_options)
     return False
 
 
@@ -1019,7 +1107,7 @@ def _strategy_classification(strategy: MountStrategyBase) -> tuple[str, str | No
     return "unknown", None
 
 
-def _redact_mount_serialization_error(error: Exception) -> MountConfigError:
+def _redact_mount_serialization_error(error: BaseException) -> MountConfigError:
     discard_mount_source_exception(error)
     safe_error = MountConfigError(
         message="sandbox session state containing mount authority could not be serialized"
@@ -1028,7 +1116,7 @@ def _redact_mount_serialization_error(error: Exception) -> MountConfigError:
     return safe_error
 
 
-def _redact_mount_state_validation_error(error: Exception, *, message: str) -> ValueError:
+def _redact_mount_state_validation_error(error: BaseException, *, message: str) -> ValueError:
     discard_mount_source_exception(error)
     safe_error = ValueError(message)
     _mark_error_data_redacted(safe_error)
@@ -1041,9 +1129,8 @@ def _mark_mount_error_for_manifest(error: MountConfigError, manifest: Manifest) 
 
 
 def _mark_mount_error_data_safe(error: MountConfigError) -> None:
-    """Mark an SDK-created mount error whose message contains no credential-derived data."""
+    """Mark an SDK-created mount error for protected-boundary reconstruction."""
     _mark_error_data_redacted(error)
-    setattr(error, _SAFE_MOUNT_VALIDATION_MESSAGE_ATTR, True)
 
 
 def _mark_mount_validation_error(error: MountConfigError) -> None:
@@ -1962,13 +2049,17 @@ def _run_state_sandbox_envelope_is_valid(payload: object) -> bool:
     )
 
 
-def _sanitize_run_state_sandbox_mount_authority(payload: object) -> tuple[object, bool]:
+def _sanitize_run_state_sandbox_mount_authority(
+    payload: object,
+    *,
+    validation_error_factory: Callable[[str], ValueError] | None = None,
+) -> tuple[object, bool]:
     """Sanitize only the documented sandbox resume-state envelope."""
 
     if not _run_state_sandbox_envelope_is_valid(payload):
         if isinstance(payload, dict | list):
             payload.clear()
-        _raise_invalid_run_state_sandbox_envelope()
+        _raise_invalid_run_state_sandbox_envelope(validation_error_factory=validation_error_factory)
     assert isinstance(payload, Mapping)
     sandbox = copy.deepcopy(dict(payload))
     redacted = False
@@ -1998,15 +2089,24 @@ def _sanitize_run_state_sandbox_mount_authority(payload: object) -> tuple[object
     return sandbox, redacted
 
 
-def sanitize_run_state_sandbox_mount_authority(payload: object) -> tuple[object, bool]:
+def sanitize_run_state_sandbox_mount_authority(
+    payload: object,
+    *,
+    validation_error_factory: Callable[[str], ValueError] | None = None,
+) -> tuple[object, bool]:
     safe_error: ValueError | None = None
     try:
-        return _sanitize_run_state_sandbox_mount_authority(payload)
-    except _InvalidRawMountManifestError as error:
-        safe_error = _redact_mount_state_validation_error(
-            error,
-            message="RunState sandbox resume state contains an invalid manifest",
+        return _sanitize_run_state_sandbox_mount_authority(
+            payload,
+            validation_error_factory=validation_error_factory,
         )
+    except _InvalidRawMountManifestError as error:
+        message = "RunState sandbox resume state contains an invalid manifest"
+        if validation_error_factory is None:
+            safe_error = _redact_mount_state_validation_error(error, message=message)
+        else:
+            discard_mount_source_exception(error)
+            safe_error = validation_error_factory(message)
 
     if isinstance(payload, dict | list):
         payload.clear()
@@ -2015,7 +2115,14 @@ def sanitize_run_state_sandbox_mount_authority(payload: object) -> tuple[object,
     _raise_data_redacted_error(safe_error)
 
 
-def _raise_invalid_run_state_sandbox_envelope() -> NoReturn:
-    error = ValueError("RunState sandbox resume state has an invalid envelope")
-    _mark_error_data_redacted(error)
+def _raise_invalid_run_state_sandbox_envelope(
+    *,
+    validation_error_factory: Callable[[str], ValueError] | None = None,
+) -> NoReturn:
+    message = "RunState sandbox resume state has an invalid envelope"
+    if validation_error_factory is None:
+        error = ValueError(message)
+        _mark_error_data_redacted(error)
+    else:
+        error = validation_error_factory(message)
     _raise_data_redacted_error(error)

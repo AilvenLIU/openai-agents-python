@@ -1946,7 +1946,7 @@ async def test_activate_rejects_credentials_before_preflights() -> None:
     with (
         patch.object(_daytona_mounts, "_ensure_fuse_support", new_callable=AsyncMock) as fuse_mock,
         patch.object(_daytona_mounts, "_ensure_rclone", new_callable=AsyncMock) as rclone_mock,
-        pytest.raises(MountConfigError),
+        pytest.raises(MountConfigError, match="sandbox mount configuration is invalid"),
     ):
         await strategy.activate(mount, session, Path("/workspace"), Path("/workspace"))
 
@@ -2030,7 +2030,7 @@ async def test_restore_after_snapshot_rejects_credentials_before_preflights() ->
     with (
         patch.object(_daytona_mounts, "_ensure_fuse_support", new_callable=AsyncMock) as fuse_mock,
         patch.object(_daytona_mounts, "_ensure_rclone", new_callable=AsyncMock) as rclone_mock,
-        pytest.raises(MountConfigError),
+        pytest.raises(MountConfigError, match="sandbox mount configuration is invalid"),
     ):
         await strategy.restore_after_snapshot(mount, session, Path("/workspace/data"))
 

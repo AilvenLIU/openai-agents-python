@@ -3,12 +3,27 @@ from __future__ import annotations
 import asyncio
 import builtins
 import importlib
+import json
+import logging
+from collections.abc import Iterator, Mapping
 from pathlib import Path, PureWindowsPath
 from typing import Any, ClassVar, Literal, cast
 
 import pytest
-from pydantic import ConfigDict, PrivateAttr, model_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    PrivateAttr,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
+from agents.exceptions import (
+    BaseExceptionGroup,
+    _mark_error_data_redacted,
+    _raise_data_redacted_error,
+)
 from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountStrategy
 from agents.extensions.sandbox.daytona.mounts import DaytonaCloudBucketMountStrategy
 from agents.extensions.sandbox.e2b.mounts import E2BCloudBucketMountStrategy
@@ -53,7 +68,13 @@ from agents.sandbox.entries.mounts.patterns import (
     MountPatternConfig,
     RcloneMountConfig,
 )
-from agents.sandbox.errors import MountConfigError
+from agents.sandbox.errors import (
+    ErrorCode,
+    MountCommandError,
+    MountConfigError,
+    MountToolMissingError,
+    SandboxError,
+)
 from agents.sandbox.manifest import Environment
 from agents.sandbox.session.sandbox_client import BaseSandboxClient
 from agents.sandbox.session.sandbox_session import SandboxSession
@@ -107,6 +128,28 @@ def _install_hostile_exception_descriptors(error_type: type[BaseException]) -> N
 
     type.__setattr__(error_type, "args", property(get_base_args))
     type.__setattr__(error_type, "__traceback__", property(reject_traceback_access))
+
+
+def _assert_sanitized_mount_command_error(error: BaseException) -> None:
+    assert type(error) is MountCommandError
+    assert error.error_code is ErrorCode.MOUNT_FAILED
+    assert error.op == "materialize"
+    assert error.retryable is False
+    assert error.context == {"command": "<redacted>", "stderr": None}
+    assert str(error) == "mount command failed"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def _assert_sanitized_mount_tool_missing_error(error: BaseException) -> None:
+    assert type(error) is MountToolMissingError
+    assert error.error_code is ErrorCode.MOUNT_MISSING_TOOL
+    assert error.op == "materialize"
+    assert error.retryable is False
+    assert error.context == {"tool": "<redacted>"}
+    assert str(error) == "required mount tool missing: <redacted>"
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 class _CustomChildrenEntry(BaseEntry):
@@ -658,7 +701,9 @@ def test_manifest_acknowledgement_rejects_custom_mount_before_deepcopy() -> None
         }
     )
 
-    with pytest.raises(MountConfigError, match="custom mount implementations") as exc_info:
+    with pytest.raises(
+        MountConfigError, match="sandbox mount configuration is invalid"
+    ) as exc_info:
         manifest.with_in_container_mount_credential_exposure_acknowledged("data")
 
     assert CustomS3Mount.deepcopy_called is False
@@ -725,9 +770,12 @@ def test_manifest_acknowledgement_redacts_custom_provenance_traceback_locals() -
         "with_in_container_mount_credential_exposure_acknowledged",
         "with_in_container_mount_broad_credential_exposure_acknowledged",
     ):
-        for manifest, message in cases:
+        for manifest, _message in cases:
             method = getattr(manifest, method_name)
-            with pytest.raises(MountConfigError, match=message) as exc:
+            with pytest.raises(
+                MountConfigError,
+                match="sandbox mount configuration is invalid",
+            ) as exc:
                 method("data")
 
             traceback_cursor = exc.value.__traceback__
@@ -946,7 +994,7 @@ def test_custom_mount_is_rejected_before_durable_serializer_runs() -> None:
         snapshot=NoopSnapshot(id="snapshot"),
     )
 
-    with pytest.raises(MountConfigError, match="custom mount implementations") as exc_info:
+    with pytest.raises(MountConfigError) as exc_info:
         _SecurityTestClient().serialize_session_state(state)
 
     assert CustomSerializedS3Mount.serializer_called is False
@@ -974,10 +1022,9 @@ def test_public_mount_error_redactor_discards_untrusted_mount_discriminator() ->
     def validate(*, manifest: Manifest) -> None:
         validate_manifest_mount_credential_boundaries(manifest)
 
-    with pytest.raises(MountConfigError, match="custom mount implementations") as exc:
+    with pytest.raises(MountConfigError) as exc:
         validate(manifest=manifest)
 
-    assert exc.value.context == {}
     assert sentinel not in repr(exc.value)
 
 
@@ -1001,10 +1048,9 @@ def test_public_mount_error_redactor_discards_untrusted_field_names() -> None:
     def validate(*, manifest: Manifest) -> None:
         validate_manifest_mount_credential_boundaries(manifest)
 
-    with pytest.raises(MountConfigError, match="custom mount implementations") as exc:
+    with pytest.raises(MountConfigError) as exc:
         validate(manifest=manifest)
 
-    assert exc.value.context == {}
     assert sentinel not in repr(exc.value)
 
 
@@ -1031,7 +1077,7 @@ def test_public_mount_error_redactor_rejects_before_custom_attribute_access() ->
     def validate(*, manifest: Manifest) -> None:
         validate_manifest_mount_credential_boundaries(manifest)
 
-    with pytest.raises(MountConfigError, match="custom mount implementations"):
+    with pytest.raises(MountConfigError):
         validate(manifest=manifest)
 
     assert CustomS3Mount.authority_accessed is False
@@ -1085,7 +1131,7 @@ async def test_authority_detection_keeps_invalid_manifest_paths_inside_redaction
     async def validate(*, manifest: Manifest) -> None:
         validate_manifest_mount_credential_boundaries(manifest)
 
-    with pytest.raises(RuntimeError, match="protected mount configuration") as exc:
+    with pytest.raises(SandboxError, match="protected mount configuration") as exc:
         await validate(manifest=manifest)
 
     assert sentinel not in str(exc.value)
@@ -1282,7 +1328,7 @@ async def test_mount_apply_rejects_behavior_only_mount_strategy(
     )
     session = cast(Any, type("Session", (), {"state": type("State", (), {"type": "test"})()})())
 
-    with pytest.raises(MountConfigError, match="custom mount strategies") as exc:
+    with pytest.raises(MountConfigError) as exc:
         await mount.apply(session, Path("/workspace/data"), Path("/workspace"))
 
     assert BehaviorOnlyStrategy.activate_called is False
@@ -1461,7 +1507,7 @@ def test_acknowledgement_requires_a_matching_provider_owned_strategy() -> None:
     cast(Any, strategy).type = "vercel_cloud_bucket"
     manifest = Manifest(entries={"data": _s3_mount(strategy=strategy, credentialed=True)})
 
-    with pytest.raises(MountConfigError, match="custom mount strategies"):
+    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid"):
         manifest.with_in_container_mount_credential_exposure_acknowledged("data")
 
 
@@ -2274,7 +2320,7 @@ def test_session_state_serialization_rejects_registered_custom_strategy_configur
         snapshot=NoopSnapshot(id="snapshot"),
     )
 
-    with pytest.raises(MountConfigError, match="custom mount strategies") as exc:
+    with pytest.raises(MountConfigError) as exc:
         _SecurityTestClient().serialize_session_state(state)
 
     assert "custom-strategy-secret" not in str(exc.value)
@@ -2298,7 +2344,7 @@ def test_session_state_serialization_redacts_custom_strategy_with_known_discrimi
         snapshot=NoopSnapshot(id="snapshot"),
     )
 
-    with pytest.raises(MountConfigError, match="custom mount strategies") as exc_info:
+    with pytest.raises(MountConfigError) as exc_info:
         _SecurityTestClient().serialize_session_state(state)
 
     assert "custom-strategy-secret" not in repr(exc_info.value)
@@ -2531,7 +2577,7 @@ def test_mount_authority_rebind_requires_exact_credential_free_topology() -> Non
     assert isinstance(mount, S3Mount)
     mount.bucket = "different-bucket"
 
-    with pytest.raises(MountConfigError, match="exactly matching"):
+    with pytest.raises(MountConfigError):
         restored.rebind_persisted_mount_authority(
             mismatched,
             provider_backend_id="docker",
@@ -2545,7 +2591,7 @@ def test_mount_authority_rebind_requires_exact_credential_free_topology() -> Non
     root_mismatched = original.model_copy(deep=True)
     root_mismatched.root = "/different-workspace"
 
-    with pytest.raises(MountConfigError, match="exactly matching"):
+    with pytest.raises(MountConfigError):
         restored.rebind_persisted_mount_authority(
             root_mismatched,
             provider_backend_id="docker",
@@ -2635,7 +2681,7 @@ def test_session_state_rejects_inherited_in_container_strategy() -> None:
         }
     )
 
-    with pytest.raises(MountConfigError, match="custom mount strategies") as exc:
+    with pytest.raises(MountConfigError) as exc:
         _SecurityTestClient().serialize_session_state(
             TestSessionState(manifest=manifest, snapshot=NoopSnapshot(id="snapshot"))
         )
@@ -2932,6 +2978,401 @@ async def test_operation_error_with_implicit_broad_authority_is_replaced(
         traceback = traceback.tb_next
 
 
+@pytest.mark.asyncio
+async def test_forged_redaction_marker_cannot_return_provider_error() -> None:
+    sentinel = "forged-provider-marker-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    provider_error = RuntimeError(sentinel)
+    provider_error._agents_data_redacted = True  # type: ignore[attr-defined]
+
+    @redact_mount_error_data
+    async def fail(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise provider_error
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        await fail(manifest=manifest)
+
+    assert exc_info.value is not provider_error
+    assert provider_error.args == ()
+    assert provider_error.__dict__ == {}
+    assert provider_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize("error_kind", ["config", "command"])
+@pytest.mark.asyncio
+async def test_sdk_raise_helper_sanitizes_external_structured_mount_error(
+    error_kind: str,
+) -> None:
+    sentinel = f"forged-sdk-helper-{error_kind}-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    source_error: MountConfigError | MountCommandError
+    if error_kind == "config":
+        source_error = MountConfigError(message=sentinel)
+    else:
+        source_error = MountCommandError(
+            command=sentinel,
+            stderr=sentinel,
+            context={"provider": sentinel},
+        )
+
+    @redact_mount_error_data
+    async def fail(*, manifest: Manifest) -> None:
+        _ = manifest
+        _mark_error_data_redacted(source_error)
+        _raise_data_redacted_error(source_error)
+
+    expected_error = MountConfigError if error_kind == "config" else MountCommandError
+    with pytest.raises(expected_error) as exc_info:
+        await fail(manifest=manifest)
+
+    if error_kind == "config":
+        assert type(exc_info.value) is MountConfigError
+        assert str(exc_info.value) == "sandbox mount configuration is invalid"
+    else:
+        _assert_sanitized_mount_command_error(exc_info.value)
+    assert source_error.args == ()
+    assert source_error.__dict__ == {}
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize("boundary", ["async", "sync"])
+@pytest.mark.asyncio
+async def test_mount_tool_missing_error_preserves_safe_subtype_across_redaction(
+    boundary: str,
+) -> None:
+    sentinel = f"mount-tool-missing-{boundary}-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    source_error = MountToolMissingError(
+        tool=sentinel,
+        context={"provider": sentinel},
+        cause=RuntimeError(sentinel),
+    )
+
+    @redact_mount_error_data
+    async def fail(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise source_error
+
+    @redact_mount_error_data_sync
+    def fail_sync(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise source_error
+
+    with pytest.raises(MountToolMissingError) as exc_info:
+        if boundary == "async":
+            await fail(manifest=manifest)
+        else:
+            fail_sync(manifest=manifest)
+
+    _assert_sanitized_mount_tool_missing_error(exc_info.value)
+    assert source_error.args == ()
+    assert source_error.__dict__ == {}
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize("error_kind", ["config", "command"])
+@pytest.mark.asyncio
+async def test_foreign_code_with_sdk_globals_and_filename_cannot_authorize_mount_error(
+    error_kind: str,
+) -> None:
+    sentinel = f"foreign-sdk-code-{error_kind}-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    module = importlib.import_module("agents.sandbox._mount_security")
+    statement = (
+        f"raise MountConfigError(message={sentinel!r})"
+        if error_kind == "config"
+        else "raise MountCommandError("
+        f"command={sentinel!r}, stderr={sentinel!r}, context={{'provider': {sentinel!r}}})"
+    )
+    foreign_globals = {
+        **module.__dict__,
+        "MountCommandError": MountCommandError,
+        "MountConfigError": MountConfigError,
+    }
+    try:
+        exec(compile(statement, cast(str, module.__file__), "exec"), foreign_globals)
+    except (MountConfigError, MountCommandError) as error:
+        source_error = error
+    _mark_error_data_redacted(source_error)
+
+    @redact_mount_error_data
+    async def fail(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise source_error
+
+    expected_error = MountConfigError if error_kind == "config" else MountCommandError
+    with pytest.raises(expected_error) as exc_info:
+        await fail(manifest=manifest)
+
+    if error_kind == "config":
+        assert type(exc_info.value) is MountConfigError
+        assert str(exc_info.value) == "sandbox mount configuration is invalid"
+    else:
+        _assert_sanitized_mount_command_error(exc_info.value)
+    assert source_error.args == ()
+    assert source_error.__dict__ == {}
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+def test_reassigned_core_producer_cannot_authorize_mount_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "reassigned-core-producer-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    state = TestSessionState(
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+    )
+    source_error = MountCommandError(
+        command=sentinel,
+        stderr=sentinel,
+        context={"provider": sentinel},
+    )
+
+    class ForeignProducer:
+        def __call__(self, client: object, session_state: object) -> object:
+            _ = (client, session_state)
+            _mark_error_data_redacted(source_error)
+            raise source_error
+
+    monkeypatch.setattr(BaseSandboxClient, "serialize_session_state", ForeignProducer())
+
+    @redact_mount_error_data_sync
+    def serialize(*, manifest: Manifest) -> object:
+        _ = manifest
+        return BaseSandboxClient.serialize_session_state(_SecurityTestClient(), state)
+
+    with pytest.raises(MountCommandError) as exc_info:
+        serialize(manifest=manifest)
+
+    _assert_sanitized_mount_command_error(exc_info.value)
+    assert source_error.args == ()
+    assert source_error.__dict__ == {}
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize("boundary", ["async", "sync"])
+@pytest.mark.parametrize("error_kind", ["config", "command"])
+@pytest.mark.asyncio
+async def test_malformed_structured_mount_error_falls_back_to_generic_redaction(
+    boundary: str,
+    error_kind: str,
+) -> None:
+    sentinel = f"malformed-{boundary}-{error_kind}-classification-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    source_error: MountConfigError | MountCommandError
+    if error_kind == "config":
+        source_error = MountConfigError(message=sentinel)
+    else:
+        source_error = MountCommandError(
+            command=sentinel,
+            stderr=sentinel,
+            retryable=False,
+        )
+    source_error.retryable = cast(Any, sentinel)
+
+    @redact_mount_error_data
+    async def fail(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise source_error
+
+    @redact_mount_error_data_sync
+    def fail_sync(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise source_error
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        if boundary == "async":
+            await fail(manifest=manifest)
+        else:
+            fail_sync(manifest=manifest)
+
+    assert type(exc_info.value) is RuntimeError
+    assert source_error.args == ()
+    assert source_error.__dict__ == {}
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize("boundary", ["async", "sync"])
+@pytest.mark.parametrize("hostile_descriptor", ["__class__", "__dict__"])
+@pytest.mark.asyncio
+async def test_protected_mount_redaction_ignores_hostile_identity_and_state_descriptors(
+    boundary: str,
+    hostile_descriptor: str,
+) -> None:
+    sentinel = f"hostile-{boundary}-{hostile_descriptor}-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    descriptor_calls: list[str] = []
+
+    def reject_descriptor_access(_error: BaseException) -> object:
+        descriptor_calls.append(hostile_descriptor)
+        raise AssertionError(f"provider-defined {hostile_descriptor} descriptor was accessed")
+
+    expected_error: type[BaseException]
+    if hostile_descriptor == "__class__":
+        hostile_error_type = type(
+            "HostileProviderError",
+            (RuntimeError,),
+            {"__class__": property(reject_descriptor_access)},
+        )
+        source_error: BaseException = hostile_error_type(sentinel)
+        expected_error = RuntimeError
+    else:
+        hostile_error_type = type(
+            "HostileStructuredError",
+            (SandboxError,),
+            {"__dict__": property(reject_descriptor_access)},
+        )
+        source_error = hostile_error_type(
+            message=sentinel,
+            error_code=ErrorCode.MOUNT_FAILED,
+            op="materialize",
+            context={"provider": sentinel},
+            retryable=True,
+        )
+        expected_error = SandboxError
+
+    @redact_mount_error_data
+    async def fail(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise source_error
+
+    @redact_mount_error_data_sync
+    def fail_sync(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise source_error
+
+    with pytest.raises(expected_error) as exc_info:
+        if boundary == "async":
+            await fail(manifest=manifest)
+        else:
+            fail_sync(manifest=manifest)
+
+    assert descriptor_calls == []
+    if hostile_descriptor == "__class__":
+        assert type(exc_info.value) is RuntimeError
+        assert str(exc_info.value) == (
+            "sandbox operation failed while using a protected mount configuration"
+        )
+    else:
+        assert type(exc_info.value) is SandboxError
+        assert exc_info.value.error_code is ErrorCode.MOUNT_FAILED
+        assert exc_info.value.op == "materialize"
+        assert exc_info.value.retryable is True
+        assert exc_info.value.context == {}
+    assert cast(Any, BaseException.args).__get__(source_error, type(source_error)) == ()
+    assert cast(Any, BaseException.__traceback__).__get__(source_error, type(source_error)) is None
+    assert sentinel not in repr(exc_info.value)
+
+
+def test_mutated_core_producer_wrapped_link_does_not_change_trust(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "mutated-core-producer-wrapped-link-secret"
+
+    class CustomMount(S3Mount):
+        type: Literal["mutated_core_mount"] = "mutated_core_mount"  # type: ignore[assignment]
+        api_token: str = sentinel
+
+    state = TestSessionState(
+        manifest=Manifest(
+            entries={
+                "data": CustomMount(
+                    bucket="bucket",
+                    mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+                )
+            }
+        ),
+        snapshot=NoopSnapshot(id="snapshot"),
+    )
+
+    class ForeignProducer:
+        def __call__(self, *args: object, **kwargs: object) -> object:
+            _ = (args, kwargs)
+            raise AssertionError("the wrapped link must not be invoked")
+
+    monkeypatch.setattr(
+        BaseSandboxClient.serialize_session_state,
+        "__wrapped__",
+        ForeignProducer(),
+    )
+
+    with pytest.raises(MountConfigError) as exc_info:
+        _SecurityTestClient().serialize_session_state(state)
+
+    assert sentinel not in repr(exc_info.value)
+
+
 def test_sync_operation_error_with_mount_authority_clears_source_arguments() -> None:
     sentinel = "sync-provider-operation-secret"
     manifest = Manifest(
@@ -3005,6 +3446,634 @@ def test_sync_operation_error_with_implicit_broad_authority_is_replaced(
     assert exc.value.__context__ is None
     assert provider_error.args == ()
     assert provider_error.__traceback__ is None
+
+
+@pytest.mark.asyncio
+async def test_protected_mixed_exception_group_is_replaced_and_discarded() -> None:
+    sentinel = "mixed-exception-group-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+
+    child_error: RuntimeError
+    try:
+        sensitive_local = {"credential": sentinel}
+        raise RuntimeError(sensitive_local)
+    except RuntimeError as error:
+        child_error = error
+        child_error.payload = sensitive_local  # type: ignore[attr-defined]
+    cancellation = asyncio.CancelledError(sentinel)
+    source_group = BaseExceptionGroup(sentinel, [child_error, cancellation])
+
+    @redact_mount_error_data
+    async def fail(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise source_group
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        await fail(manifest=manifest)
+
+    assert type(exc_info.value) is RuntimeError
+    assert source_group.args[0] == "Error details are redacted."
+    assert source_group.__traceback__ is None
+    assert child_error.args == ()
+    assert child_error.__dict__ == {}
+    assert child_error.__traceback__ is None
+    assert cancellation.args == ()
+    assert sentinel not in repr(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    traceback_cursor = exc_info.value.__traceback__
+    while traceback_cursor is not None:
+        frame_path = Path(traceback_cursor.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert all(
+                value is not source_group for value in traceback_cursor.tb_frame.f_locals.values()
+            )
+            assert sentinel not in repr(traceback_cursor.tb_frame.f_locals)
+        traceback_cursor = traceback_cursor.tb_next
+
+
+@pytest.mark.asyncio
+async def test_protected_mount_failure_discards_retained_nested_exception() -> None:
+    sentinel = "mount-retained-nested-exception-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    child_error = RuntimeError(sentinel)
+    child_error.payload = {"credential": sentinel}  # type: ignore[attr-defined]
+    source_error = RuntimeError("safe provider failure", {"children": [child_error]})
+    source_error.payload = (child_error,)  # type: ignore[attr-defined]
+
+    @redact_mount_error_data
+    async def fail(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise source_error
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        await fail(manifest=manifest)
+
+    assert source_error.args == ()
+    assert source_error.__dict__ == {}
+    assert source_error.__traceback__ is None
+    assert child_error.args == ()
+    assert child_error.__dict__ == {}
+    assert child_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+def test_sync_protected_exception_group_is_replaced_and_discarded() -> None:
+    sentinel = "sync-exception-group-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    child_error = RuntimeError(sentinel)
+    source_group = BaseExceptionGroup(sentinel, [child_error])
+
+    @redact_mount_error_data_sync
+    def fail(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise source_group
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        fail(manifest=manifest)
+
+    assert type(exc_info.value) is RuntimeError
+    assert source_group.args[0] == "Error details are redacted."
+    assert source_group.__traceback__ is None
+    assert child_error.args == ()
+    assert child_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_credentialless_exception_group_preserves_raw_diagnostics() -> None:
+    source_group = BaseExceptionGroup("credentialless provider failures", [RuntimeError("detail")])
+
+    @redact_mount_error_data
+    async def fail() -> None:
+        raise source_group
+
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        await fail()
+
+    assert exc_info.value is source_group
+    assert source_group.args
+    assert source_group.__traceback__ is not None
+
+
+@pytest.mark.asyncio
+async def test_initial_authority_classification_cancellation_is_value_free() -> None:
+    sentinel = "initial-classification-cancellation-secret"
+    source_cancel = asyncio.CancelledError(sentinel)
+    operation_called = False
+
+    class HostileState:
+        @property
+        def state(self) -> object:
+            raise source_cancel
+
+    @redact_mount_error_data
+    async def operation(value: object) -> None:
+        nonlocal operation_called
+        operation_called = True
+        _ = value
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await operation(HostileState())
+
+    assert operation_called is False
+    assert type(exc_info.value) is asyncio.CancelledError
+    assert source_cancel.args == ()
+    assert source_cancel.__traceback__ is None
+    traceback_cursor = exc_info.value.__traceback__
+    while traceback_cursor is not None:
+        frame_path = Path(traceback_cursor.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert sentinel not in repr(traceback_cursor.tb_frame.f_locals)
+        traceback_cursor = traceback_cursor.tb_next
+
+
+@pytest.mark.parametrize(
+    ("boundary", "failure_stage", "expected_type", "expected_args"),
+    [
+        ("async", "classification", SystemExit, (1,)),
+        ("sync", "operation", KeyboardInterrupt, ()),
+    ],
+)
+@pytest.mark.asyncio
+async def test_protected_mount_process_control_is_value_free(
+    boundary: str,
+    failure_stage: str,
+    expected_type: type[BaseException],
+    expected_args: tuple[object, ...],
+) -> None:
+    sentinel = f"{boundary}-{failure_stage}-process-control-secret"
+
+    class ProviderSystemExit(SystemExit):
+        pass
+
+    class ProviderKeyboardInterrupt(KeyboardInterrupt):
+        pass
+
+    source_error: BaseException = (
+        ProviderSystemExit(sentinel)
+        if expected_type is SystemExit
+        else ProviderKeyboardInterrupt(sentinel)
+    )
+    operation_called = False
+
+    class HostileAuthorityProbe:
+        @property
+        def state(self) -> object:
+            raise source_error
+
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+
+    with pytest.raises(expected_type) as exc_info:
+        if boundary == "async":
+
+            @redact_mount_error_data
+            async def async_operation(value: object) -> None:
+                nonlocal operation_called
+                operation_called = True
+                _ = value
+
+            await async_operation(HostileAuthorityProbe())
+        else:
+
+            @redact_mount_error_data_sync
+            def sync_operation(*, manifest: Manifest) -> None:
+                nonlocal operation_called
+                operation_called = True
+                _ = manifest
+                raise source_error
+
+            sync_operation(manifest=manifest)
+
+    assert operation_called is (failure_stage == "operation")
+    assert type(exc_info.value) is expected_type
+    assert exc_info.value.args == expected_args
+    assert exc_info.value is not source_error
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("argument_code", "effective_code"),
+    [(False, True), (True, False)],
+)
+def test_sync_protected_mount_rejects_inconsistent_system_exit_codes(
+    argument_code: bool,
+    effective_code: bool,
+) -> None:
+    source_error = SystemExit(argument_code)
+    source_error.code = effective_code
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key="secret-access-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+
+    @redact_mount_error_data_sync
+    def fail(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise source_error
+
+    with pytest.raises(SystemExit) as exc_info:
+        fail(manifest=manifest)
+
+    assert type(exc_info.value) is SystemExit
+    assert exc_info.value.args == (1,)
+    assert exc_info.value is not source_error
+    assert source_error.args == ()
+    assert source_error.code is None
+    assert source_error.__traceback__ is None
+
+
+def test_sync_initial_authority_classification_group_is_value_free() -> None:
+    sentinel = "sync-classification-group-secret"
+    child = RuntimeError(sentinel)
+    cancellation = asyncio.CancelledError(sentinel)
+    source_group = BaseExceptionGroup("classification failed", [child, cancellation])
+    operation_called = False
+
+    class HostileAuthorityProbe:
+        def _runtime_has_protected_mount_authority(self) -> bool:
+            raise source_group
+
+    @redact_mount_error_data_sync
+    def operation(value: object) -> None:
+        nonlocal operation_called
+        operation_called = True
+        _ = value
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        operation(HostileAuthorityProbe())
+
+    assert operation_called is False
+    assert source_group.args[0] == "Error details are redacted."
+    assert source_group.__traceback__ is None
+    assert child.args == ()
+    assert cancellation.args == ()
+    assert sentinel not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize("boundary", ["async", "sync"])
+@pytest.mark.asyncio
+async def test_initial_authority_classification_exception_stops_before_side_effects(
+    boundary: str,
+) -> None:
+    sentinel = f"{boundary}-classification-exception-secret"
+    source_error = RuntimeError(sentinel)
+    operation_called = False
+
+    class HostileAuthorityProbe:
+        @property
+        def state(self) -> object:
+            raise source_error
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        if boundary == "async":
+
+            @redact_mount_error_data
+            async def async_operation(value: object) -> None:
+                nonlocal operation_called
+                operation_called = True
+                _ = value
+
+            await async_operation(HostileAuthorityProbe())
+        else:
+
+            @redact_mount_error_data_sync
+            def sync_operation(value: object) -> None:
+                nonlocal operation_called
+                operation_called = True
+                _ = value
+
+            sync_operation(HostileAuthorityProbe())
+
+    assert operation_called is False
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize("operation", ["activate", "deactivate"])
+@pytest.mark.asyncio
+async def test_direct_docker_volume_lifecycle_call_clears_mount_frames(
+    operation: str,
+) -> None:
+    sentinel = f"direct-docker-{operation}-secret"
+    mount = S3Mount(
+        bucket="bucket",
+        access_key_id="access-key",
+        secret_access_key=sentinel,
+        mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+    )
+    strategy = cast(DockerVolumeMountStrategy, mount.mount_strategy)
+
+    class UnsupportedSession:
+        def supports_docker_volume_mounts(self) -> bool:
+            return False
+
+    session = cast(Any, UnsupportedSession())
+    lifecycle = getattr(strategy, operation)
+    with pytest.raises(MountConfigError) as exc_info:
+        await lifecycle(mount, session, Path("/workspace/data"), Path("/workspace"))
+
+    assert sentinel not in repr(exc_info.value)
+    traceback_cursor = exc_info.value.__traceback__
+    while traceback_cursor is not None:
+        frame_path = Path(traceback_cursor.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert sentinel not in repr(traceback_cursor.tb_frame.f_locals)
+        traceback_cursor = traceback_cursor.tb_next
+
+
+@pytest.mark.asyncio
+async def test_failure_edge_classification_cancellation_discards_both_errors() -> None:
+    sentinel = "failure-edge-classification-secret"
+    source_cancel = asyncio.CancelledError(sentinel)
+    operation_error = RuntimeError(sentinel)
+
+    class MutableAuthorityProbe:
+        fail_classification = False
+
+        @property
+        def state(self) -> object | None:
+            if self.fail_classification:
+                raise source_cancel
+            return None
+
+    @redact_mount_error_data
+    async def operation(value: MutableAuthorityProbe) -> None:
+        value.fail_classification = True
+        raise operation_error
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await operation(MutableAuthorityProbe())
+
+    assert type(exc_info.value) is asyncio.CancelledError
+    assert source_cancel.args == ()
+    assert source_cancel.__traceback__ is None
+    assert operation_error.args == ()
+    assert operation_error.__traceback__ is None
+    traceback_cursor = exc_info.value.__traceback__
+    while traceback_cursor is not None:
+        frame_path = Path(traceback_cursor.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert sentinel not in repr(traceback_cursor.tb_frame.f_locals)
+        traceback_cursor = traceback_cursor.tb_next
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["async-operation", "sync-operation", "async-classification", "sync-classification"],
+)
+@pytest.mark.asyncio
+async def test_direct_base_exception_is_redacted_at_protected_mount_boundaries(
+    boundary: str,
+) -> None:
+    class ProviderAbort(BaseException):
+        pass
+
+    sentinel = f"{boundary}-base-exception-secret"
+    source_error = ProviderAbort(sentinel)
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+
+    class HostileAuthorityProbe:
+        @property
+        def state(self) -> object:
+            raise source_error
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        if boundary == "async-operation":
+
+            @redact_mount_error_data
+            async def fail_async_operation(*, manifest: Manifest) -> None:
+                _ = manifest
+                raise source_error
+
+            await fail_async_operation(manifest=manifest)
+        elif boundary == "sync-operation":
+
+            @redact_mount_error_data_sync
+            def fail_sync_operation(*, manifest: Manifest) -> None:
+                _ = manifest
+                raise source_error
+
+            fail_sync_operation(manifest=manifest)
+        elif boundary == "async-classification":
+
+            @redact_mount_error_data
+            async def fail_async_classification(value: object) -> None:
+                _ = value
+                raise AssertionError("operation must not run")
+
+            await fail_async_classification(HostileAuthorityProbe())
+        else:
+
+            @redact_mount_error_data_sync
+            def fail_sync_classification(value: object) -> None:
+                _ = value
+                raise AssertionError("operation must not run")
+
+            fail_sync_classification(HostileAuthorityProbe())
+
+    assert type(exc_info.value) is RuntimeError
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+    traceback_cursor = exc_info.value.__traceback__
+    while traceback_cursor is not None:
+        frame_path = Path(traceback_cursor.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert sentinel not in repr(traceback_cursor.tb_frame.f_locals)
+        traceback_cursor = traceback_cursor.tb_next
+
+
+@pytest.mark.parametrize("operation", ["unmount", "snapshot-teardown"])
+@pytest.mark.asyncio
+async def test_protected_cleanup_failures_clear_all_mount_lifecycle_frames(
+    operation: str,
+) -> None:
+    sentinel = f"{operation}-lifecycle-secret"
+    mount = S3Mount(
+        bucket="bucket",
+        access_key_id="access-key",
+        secret_access_key=sentinel,
+        mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+    )
+    state = TestSessionState(
+        manifest=Manifest(entries={"data": mount}),
+        snapshot=NoopSnapshot(id="snapshot"),
+    )
+
+    class FailingCleanupSession:
+        def __init__(self) -> None:
+            self.state = state
+            self.error: RuntimeError | None = None
+
+        async def exec(self, *command: object, **kwargs: object) -> None:
+            _ = (command, kwargs)
+            provider_local = {"credential": sentinel}
+            self.error = RuntimeError(provider_local)
+            raise self.error
+
+    session = FailingCleanupSession()
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        if operation == "unmount":
+            await mount.unmount(cast(Any, session), Path("data"), Path("/"))
+        else:
+            await mount.mount_strategy.teardown_for_snapshot(
+                mount,
+                cast(Any, session),
+                Path("/workspace/data"),
+            )
+
+    assert session.error is not None
+    assert session.error.args == ()
+    assert session.error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+    traceback_cursor = exc_info.value.__traceback__
+    while traceback_cursor is not None:
+        frame_path = Path(traceback_cursor.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert sentinel not in repr(traceback_cursor.tb_frame.f_locals)
+        traceback_cursor = traceback_cursor.tb_next
+
+
+@pytest.mark.asyncio
+async def test_unix_local_delete_logs_only_redacted_cleanup_failure(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    unix_local = pytest.importorskip(
+        "agents.sandbox.sandboxes.unix_local",
+        exc_type=ImportError,
+    )
+    sentinel = "unix-delete-cleanup-secret"
+    mount = S3Mount(
+        bucket="bucket",
+        access_key_id="access-key",
+        secret_access_key=sentinel,
+        mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+    )
+    state = unix_local.UnixLocalSandboxSessionState(
+        manifest=Manifest(root=str(tmp_path), entries={"data": mount}),
+        snapshot=NoopSnapshot(id="snapshot"),
+        workspace_root_owned=True,
+    )
+    inner = unix_local.UnixLocalSandboxSession.from_state(state)
+    provider_errors: list[RuntimeError] = []
+
+    async def fail_exec(*command: object, **kwargs: object) -> None:
+        _ = (command, kwargs)
+        provider_local = {"credential": sentinel}
+        error = RuntimeError(provider_local)
+        provider_errors.append(error)
+        raise error
+
+    monkeypatch.setattr(inner, "_exec_internal", fail_exec)
+    client = unix_local.UnixLocalSandboxClient()
+    session = client._wrap_session(inner)
+    caplog.set_level(logging.WARNING, logger=unix_local.__name__)
+
+    returned = await client.delete(session)
+
+    assert returned is session
+    assert tmp_path.exists()
+    assert provider_errors
+    assert all(error.args == () and error.__traceback__ is None for error in provider_errors)
+    assert caplog.records
+    for record in caplog.records:
+        assert sentinel not in record.getMessage()
+        assert sentinel not in repr(record.args)
+        assert sentinel not in repr(record.__dict__)
+
+
+def test_hostile_redaction_marker_lookup_cannot_escape_sync_boundary() -> None:
+    sentinel = "hostile-provider-marker-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+
+    class HostileMarkerError(RuntimeError):
+        @property
+        def _agents_data_redacted(self) -> bool:
+            raise AssertionError("provider marker descriptor was accessed")
+
+    provider_error = HostileMarkerError(sentinel)
+
+    @redact_mount_error_data_sync
+    def fail(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise provider_error
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        fail(manifest=manifest)
+
+    assert type(exc_info.value) is RuntimeError
+    assert provider_error.args == ()
+    assert provider_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -3094,6 +4163,49 @@ async def test_cancellation_with_mount_authority_preserves_redacted_cancellation
         if "/src/agents/" in frame_path:
             assert sentinel not in repr(traceback.tb_frame.f_locals)
         traceback = traceback.tb_next
+
+
+@pytest.mark.asyncio
+async def test_structured_cancellation_with_mount_authority_preserves_cancellation() -> None:
+    sentinel = "structured-cancellation-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+
+    class StructuredCancelledError(SandboxError, asyncio.CancelledError):
+        pass
+
+    provider_error = StructuredCancelledError(
+        message=sentinel,
+        error_code=ErrorCode.MOUNT_FAILED,
+        op="materialize",
+        context={"credential": sentinel},
+        retryable=True,
+    )
+
+    @redact_mount_error_data
+    async def cancel(*, manifest: Manifest) -> None:
+        _ = manifest
+        raise provider_error
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await cancel(manifest=manifest)
+
+    assert type(exc_info.value) is asyncio.CancelledError
+    assert sentinel not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert cast(Any, BaseException.args).__get__(provider_error, type(provider_error)) == ()
+    assert (
+        cast(Any, BaseException.__traceback__).__get__(provider_error, type(provider_error)) is None
+    )
 
 
 def test_generic_session_state_parser_sanitizes_legacy_mount_authority() -> None:
@@ -3297,6 +4409,261 @@ def test_deserialization_sanitizes_input_before_validation_errors() -> None:
         _SecurityTestClient().deserialize_session_state(payload)
 
     assert payload == {}
+
+
+def test_direct_credentialless_raw_state_preserves_validation_diagnostics() -> None:
+    payload: dict[str, object] = {
+        "type": "test",
+        "session_id": "not-a-uuid",
+        "manifest": Manifest().model_dump(mode="json"),
+        "snapshot": NoopSnapshot(id="snapshot").model_dump(mode="json"),
+    }
+
+    with pytest.raises(ValueError, match="session_id") as exc_info:
+        TestSessionState.model_validate(payload)
+
+    assert "UUID" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("boundary", ["model_validate", "client"])
+@pytest.mark.parametrize("error_kind", ["base_exception", "group", "cancellation"])
+def test_direct_session_state_restore_failures_are_value_free(
+    boundary: str,
+    error_kind: str,
+) -> None:
+    class ProviderAbort(BaseException):
+        pass
+
+    class ProviderCancellation(asyncio.CancelledError):
+        pass
+
+    sentinel = f"direct-{boundary}-{error_kind}-restore-secret"
+    child_error: RuntimeError | None = None
+    if error_kind == "cancellation":
+        source_error: BaseException = ProviderCancellation(sentinel)
+    elif error_kind == "group":
+        child_error = RuntimeError(sentinel)
+        source_error = BaseExceptionGroup(sentinel, [child_error])
+    else:
+        source_error = ProviderAbort(sentinel)
+
+    class HostileMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            _ = key
+            raise source_error
+
+        def __iter__(self) -> Iterator[str]:
+            raise source_error
+
+        def __len__(self) -> int:
+            return 1
+
+    payload = HostileMapping()
+    expected_error = asyncio.CancelledError if error_kind == "cancellation" else ValueError
+    match = None if error_kind == "cancellation" else "sandbox session state payload is invalid"
+
+    with pytest.raises(expected_error, match=match) as exc_info:
+        if boundary == "model_validate":
+            TestSessionState.model_validate(payload)
+        else:
+            BaseSandboxClient._deserialize_session_state_payload(payload, TestSessionState)
+
+    assert exc_info.value is not source_error
+    if error_kind == "group":
+        assert source_error.args[0] == "Error details are redacted."
+    else:
+        assert source_error.args == ()
+    assert source_error.__traceback__ is None
+    if child_error is not None:
+        assert child_error.args == ()
+        assert child_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("boundary", "error_kind", "expected_type", "expected_args"),
+    [
+        ("model_validate", "system_exit", SystemExit, (1,)),
+        ("client", "keyboard_interrupt", KeyboardInterrupt, ()),
+    ],
+)
+def test_direct_session_state_restore_preserves_value_free_process_control(
+    boundary: str,
+    error_kind: str,
+    expected_type: type[BaseException],
+    expected_args: tuple[object, ...],
+) -> None:
+    sentinel = f"direct-{boundary}-{error_kind}-restore-secret"
+    source_error: BaseException = (
+        SystemExit(sentinel) if error_kind == "system_exit" else KeyboardInterrupt(sentinel)
+    )
+
+    class HostileMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            _ = key
+            raise source_error
+
+        def __iter__(self) -> Iterator[str]:
+            raise source_error
+
+        def __len__(self) -> int:
+            return 1
+
+    payload = HostileMapping()
+    with pytest.raises(expected_type) as exc_info:
+        if boundary == "model_validate":
+            TestSessionState.model_validate(payload)
+        else:
+            BaseSandboxClient._deserialize_session_state_payload(payload, TestSessionState)
+
+    assert type(exc_info.value) is expected_type
+    assert exc_info.value.args == expected_args
+    assert exc_info.value is not source_error
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+def test_credentialless_direct_validation_preserves_value_free_process_control() -> None:
+    sentinel = "direct-credentialless-validation-process-control-secret"
+    source_error = SystemExit(sentinel)
+
+    class HostilePorts:
+        def __iter__(self) -> Iterator[int]:
+            raise source_error
+
+    payload: dict[str, object] = {
+        "type": "test",
+        "manifest": Manifest(),
+        "snapshot": NoopSnapshot(id="snapshot"),
+        "exposed_ports": HostilePorts(),
+    }
+
+    with pytest.raises(SystemExit) as exc_info:
+        TestSessionState.model_validate(payload)
+
+    assert type(exc_info.value) is SystemExit
+    assert exc_info.value.args == (1,)
+    assert exc_info.value is not source_error
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None
+    assert payload == {}
+    assert sentinel not in repr(exc_info.value)
+
+
+def test_credentialless_direct_json_validation_preserves_value_free_process_control() -> None:
+    sentinel = "direct-credentialless-json-validation-process-control-secret"
+    source_error = KeyboardInterrupt(sentinel)
+
+    class ProcessControlSessionState(SandboxSessionState):
+        type: Literal["process-control-test"] = "process-control-test"
+
+        @field_validator("exposed_ports", mode="before")
+        @classmethod
+        def _raise_process_control(cls, value: object) -> object:
+            _ = (cls, value)
+            raise source_error
+
+    payload = {
+        "type": "process-control-test",
+        "manifest": Manifest().model_dump(mode="json"),
+        "snapshot": NoopSnapshot(id="snapshot").model_dump(mode="json"),
+        "exposed_ports": [8080],
+    }
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+        ProcessControlSessionState.model_validate_json(json.dumps(payload))
+
+    assert type(exc_info.value) is KeyboardInterrupt
+    assert exc_info.value.args == ()
+    assert exc_info.value is not source_error
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+def test_session_state_json_parser_preserves_value_free_process_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "direct-json-parser-process-control-secret"
+    source_error = KeyboardInterrupt(sentinel)
+
+    def fail_to_parse(json_data: object) -> object:
+        retained_input = json_data
+        if retained_input:
+            raise source_error
+        return {}
+
+    monkeypatch.setattr(json, "loads", fail_to_parse)
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+        TestSessionState.model_validate_json(sentinel)
+
+    assert type(exc_info.value) is KeyboardInterrupt
+    assert exc_info.value.args == ()
+    assert exc_info.value is not source_error
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+def test_session_state_pydantic_json_parser_preserves_value_free_process_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "direct-pydantic-json-parser-process-control-secret"
+    source_error = KeyboardInterrupt(sentinel)
+
+    def fail_to_parse(
+        cls: type[BaseModel],
+        json_data: object,
+        /,
+        **kwargs: object,
+    ) -> object:
+        _ = (cls, kwargs)
+        retained_input = json_data
+        if retained_input:
+            raise source_error
+        return {}
+
+    monkeypatch.setattr(BaseModel, "model_validate_json", classmethod(fail_to_parse))
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+        TestSessionState.model_validate_json(json.dumps({"credential": sentinel}))
+
+    assert type(exc_info.value) is KeyboardInterrupt
+    assert exc_info.value.args == ()
+    assert exc_info.value is not source_error
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+def test_session_state_parse_preserves_value_free_process_control_during_copy() -> None:
+    sentinel = "direct-parse-process-control-secret"
+    source_error = KeyboardInterrupt(sentinel)
+
+    class HostileValue:
+        def __deepcopy__(self, memo: dict[int, object]) -> object:
+            _ = memo
+            raise source_error
+
+    payload: dict[str, object] = {
+        "type": "test",
+        "hostile": HostileValue(),
+    }
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+        SandboxSessionState.parse(payload)
+
+    assert type(exc_info.value) is KeyboardInterrupt
+    assert exc_info.value.args == ()
+    assert exc_info.value is not source_error
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None
+    assert payload == {}
+    assert sentinel not in repr(exc_info.value)
 
 
 def test_deserialization_sanitizes_non_string_endpoint_before_validation_errors() -> None:

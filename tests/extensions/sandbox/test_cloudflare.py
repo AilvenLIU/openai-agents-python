@@ -33,6 +33,7 @@ from agents.sandbox.errors import (
     InvalidManifestPathError,
     MountConfigError,
     PtySessionNotFoundError,
+    SandboxError,
     SandboxRuntimeError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
@@ -589,7 +590,7 @@ async def test_cloudflare_protected_mount_state_drops_identity_before_resume() -
         provider_backend_id="cloudflare",
     )
 
-    with pytest.raises(RuntimeError, match="protected mount configuration"):
+    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid"):
         await client.resume(rebound)
 
 
@@ -617,7 +618,7 @@ async def test_cloudflare_resume_rejects_direct_state_with_configured_authority(
 
     monkeypatch.setattr(CloudflareSandboxSession, "running", running)
 
-    with pytest.raises(RuntimeError, match="protected mount configuration"):
+    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid"):
         await CloudflareSandboxClient().resume(_make_state(manifest=manifest))
 
     assert provider_calls == 0
@@ -1595,7 +1596,7 @@ async def test_cloudflare_direct_persistence_redacts_protected_remount_failure(
     )
     sess = _make_session(state=_make_state(manifest=manifest), fake_http=fake_http)
 
-    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+    with pytest.raises(SandboxError, match="protected mount configuration") as exc_info:
         if operation == "persist":
             await sess.persist_workspace()
         else:

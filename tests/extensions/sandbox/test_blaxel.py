@@ -1652,7 +1652,7 @@ class TestStartLifecycle:
         session = _make_session(fake_sandbox, state=state)
         session._skip_start = skip_start
 
-        with pytest.raises(MountConfigError) as exc:
+        with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid") as exc:
             await session.start()
 
         assert fake_sandbox.process.exec_calls == []
@@ -2997,7 +2997,6 @@ class TestMountsModule:
 
     def test_build_mount_config_unsupported(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import _build_mount_config
-        from agents.sandbox.errors import MountConfigError
 
         # Use a MagicMock with a type attribute to simulate an unsupported mount.
         mount = MagicMock()
@@ -3007,7 +3006,6 @@ class TestMountsModule:
 
     def test_assert_blaxel_session_wrong_type(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import _assert_blaxel_session
-        from agents.sandbox.errors import MountConfigError
 
         class _WrongSession:
             pass
@@ -3206,7 +3204,6 @@ class TestMountsModule:
     @pytest.mark.asyncio
     async def test_mount_s3_fails(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountConfig, _mount_s3
-        from agents.sandbox.errors import MountConfigError
 
         session = _FakeMountSession()
         session._next_results = [
@@ -3371,7 +3368,6 @@ class TestMountsModule:
     @pytest.mark.asyncio
     async def test_mount_gcs_fails(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountConfig, _mount_gcs
-        from agents.sandbox.errors import MountConfigError
 
         session = _FakeMountSession()
         session._next_results = [
@@ -3481,7 +3477,6 @@ class TestMountsModule:
     @pytest.mark.asyncio
     async def test_install_tool_fails_after_retries(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import _install_tool
-        from agents.sandbox.errors import MountConfigError
 
         session = _FakeMountSession()
         session._next_results = [
@@ -3540,7 +3535,7 @@ class TestMountsModule:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_activate_preserves_safe_credential_cleanup_error(self) -> None:
+    async def test_activate_redacts_credential_cleanup_error(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountStrategy
         from agents.sandbox.entries import S3Mount
 
@@ -3566,8 +3561,8 @@ class TestMountsModule:
 
         with pytest.raises(
             MountConfigError,
-            match="failed to remove mount credential file",
-        ):
+            match="sandbox mount configuration is invalid",
+        ) as exc_info:
             await strategy.activate(
                 mount,
                 session,  # type: ignore[arg-type]
@@ -3575,6 +3570,8 @@ class TestMountsModule:
                 Path("/workspace"),
             )
 
+        assert exc_info.value.context == {}
+        assert exc_info.value.retryable is False
         assert "s3-cleanup-secret" not in repr(session.exec_calls)
 
     @pytest.mark.asyncio
@@ -3629,7 +3626,7 @@ class TestMountsModule:
         )
 
     @pytest.mark.asyncio
-    async def test_restore_preserves_cleanup_error_over_mount_error(self) -> None:
+    async def test_restore_redacts_cleanup_error_over_mount_error(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountStrategy
         from agents.sandbox.entries import GCSMount
 
@@ -3653,14 +3650,16 @@ class TestMountsModule:
 
         with pytest.raises(
             MountConfigError,
-            match="failed to remove mount credential file",
-        ):
+            match="sandbox mount configuration is invalid",
+        ) as exc_info:
             await strategy.restore_after_snapshot(
                 mount,
                 session,  # type: ignore[arg-type]
                 Path("/workspace/data"),
             )
 
+        assert exc_info.value.context == {}
+        assert exc_info.value.retryable is False
         assert "gcs-cleanup-secret" not in repr(session.exec_calls)
 
 
@@ -3913,7 +3912,6 @@ class TestDriveMounts:
     @pytest.mark.asyncio
     async def test_attach_drive_error(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelDriveMountConfig, _attach_drive
-        from agents.sandbox.errors import MountConfigError
 
         sandbox = _FakeSandboxInstance()
         sandbox.drives.mount_error = RuntimeError("mount api error")
@@ -3926,7 +3924,6 @@ class TestDriveMounts:
     @pytest.mark.asyncio
     async def test_attach_drive_no_drives_api(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelDriveMountConfig, _attach_drive
-        from agents.sandbox.errors import MountConfigError
 
         class _NoDrives:
             pass
@@ -3999,7 +3996,6 @@ class TestDriveMounts:
     @pytest.mark.asyncio
     async def test_drive_strategy_validate_wrong_mount_type(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelDriveMountStrategy
-        from agents.sandbox.errors import MountConfigError
 
         strategy = BlaxelDriveMountStrategy()
         mount = MagicMock()
@@ -4010,7 +4006,6 @@ class TestDriveMounts:
     @pytest.mark.asyncio
     async def test_drive_strategy_validate_non_drive_mount(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelDriveMountStrategy
-        from agents.sandbox.errors import MountConfigError
 
         strategy = BlaxelDriveMountStrategy()
         mount = MagicMock()

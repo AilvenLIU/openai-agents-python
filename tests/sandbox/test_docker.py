@@ -47,6 +47,7 @@ from agents.sandbox.errors import (
     InvalidManifestPathError,
     MountConfigError,
     PtySessionNotFoundError,
+    SandboxError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
@@ -2401,7 +2402,7 @@ async def test_docker_direct_persist_redacts_protected_mount_provider_error(
 
     monkeypatch.setattr(session, "_stage_workspace_copy", fail_stage_workspace_copy)
 
-    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+    with pytest.raises(SandboxError, match="protected mount configuration") as exc_info:
         await session.persist_workspace()
 
     assert sentinel not in str(exc_info.value)
