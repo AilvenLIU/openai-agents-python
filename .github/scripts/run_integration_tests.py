@@ -10,10 +10,19 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from integration_tests._contract_support import (  # noqa: E402
+    SubmoduleExportPolicy,
+    load_submodule_export_policy,
+)
+
 WORKSPACE = ROOT / ".tmp" / "integration-tests"
 DIST = WORKSPACE / "dist"
 RESULTS = WORKSPACE / "results"
 TESTS = ROOT / "integration_tests"
+CONTRACT_POLICY = ROOT / "tests" / "fixtures" / "released_api_contract_policy.json"
+PROSPECTIVE_CONTRACT_ENV = "OPENAI_AGENTS_PROSPECTIVE_RELEASE_CONTRACT"
 EXTRAS = "any-llm,litellm,realtime,voice"
 OPTIONAL_EXTRAS = (
     "any-llm",
@@ -29,6 +38,7 @@ OPTIONAL_EXTRAS = (
 STRICT_PROFILES = frozenset({"release", "security"})
 PROFILES = (
     "packaging",
+    "prospective-contract",
     "security",
     "mcp-v1",
     "core",
@@ -352,6 +362,15 @@ def main() -> None:
         help="Include configured direct Anthropic and Gemini providers alongside OpenRouter.",
     )
     args = parser.parse_args()
+    prospective_policy: SubmoduleExportPolicy | None = None
+    if args.profile == "prospective-contract":
+        prospective_contract = os.environ.get(PROSPECTIVE_CONTRACT_ENV)
+        if not prospective_contract or not Path(prospective_contract).is_file():
+            raise RuntimeError(
+                "The prospective-contract profile requires "
+                f"{PROSPECTIVE_CONTRACT_ENV} to name an existing contract file."
+            )
+        prospective_policy = load_submodule_export_policy(CONTRACT_POLICY)
     if args.profile in STRICT_PROFILES:
         os.environ["OPENAI_AGENTS_INTEGRATION_STRICT"] = "1"
     shutil.rmtree(RESULTS / args.profile, ignore_errors=True)
@@ -381,6 +400,7 @@ def main() -> None:
 
     if args.profile in {
         "packaging",
+        "prospective-contract",
         "security",
         "core",
         "hosted",
@@ -396,6 +416,7 @@ def main() -> None:
         )
         selections = {
             "packaging": "packaging",
+            "prospective-contract": "packaging",
             "security": "security",
             "core": "packaging or core",
             "hosted": "packaging or hosted",
@@ -434,7 +455,15 @@ def main() -> None:
             profile=args.profile,
         )
 
-    if args.profile in {"packaging", "security", "full", "release", "nightly", "manual"}:
+    if args.profile in {
+        "packaging",
+        "prospective-contract",
+        "security",
+        "full",
+        "release",
+        "nightly",
+        "manual",
+    }:
         python = create_environment(
             "sdist",
             sdist,
@@ -456,6 +485,28 @@ def main() -> None:
             environment_kind="sdist",
             profile=args.profile,
         )
+
+    if args.profile == "prospective-contract":
+        assert prospective_policy is not None
+        selected_extras = ",".join(prospective_policy.dependency_extras) or None
+        for artifact_kind, distribution in (("wheel", wheel), ("sdist", sdist)):
+            environment_kind = f"{artifact_kind}-prospective-dependencies"
+            python = create_environment(
+                environment_kind,
+                distribution,
+                optional_extra=selected_extras,
+                additional_requirements=prospective_policy.dependency_requirements,
+            )
+            run_suite(
+                python,
+                wheel,
+                sdist,
+                selection="packaging_dependency",
+                environment_kind=environment_kind,
+                additional_env={"OPENAI_AGENTS_INTEGRATION_REQUIRE_OPTIONAL_EXPORTS": "1"},
+                profile=args.profile,
+                require_no_skips=True,
+            )
 
     if args.profile in {"packaging", "release"}:
         for artifact_kind, distribution in (("wheel", wheel), ("sdist", sdist)):
