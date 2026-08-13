@@ -5,10 +5,15 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from email.utils import parsedate_to_datetime
-from typing import Any
+from typing import Any, cast
 
-import httpx
+import httpx2
 from openai import APIStatusError
+
+from .._httpx_compat import legacy_httpx_types
+
+_HTTP_HEADER_TYPES: tuple[type[Any], ...] = (*legacy_httpx_types("Headers"), httpx2.Headers)
+_HTTP_RESPONSE_TYPES: tuple[type[Any], ...] = (*legacy_httpx_types("Response"), httpx2.Response)
 
 
 def iter_error_chain(error: Exception) -> Iterator[Exception]:
@@ -23,7 +28,7 @@ def iter_error_chain(error: Exception) -> Iterator[Exception]:
 
 def header_lookup(headers: Any, key: str) -> str | None:
     normalized_key = key.lower()
-    if isinstance(headers, httpx.Headers):
+    if isinstance(headers, _HTTP_HEADER_TYPES):
         value = headers.get(key)
         return value if isinstance(value, str) else None
     if isinstance(headers, Mapping):
@@ -35,8 +40,8 @@ def header_lookup(headers: Any, key: str) -> str | None:
 
 def _get_candidate_header(candidate: Exception, key: str) -> str | None:
     response = getattr(candidate, "response", None)
-    if isinstance(response, httpx.Response):
-        header_value = header_lookup(response.headers, key)
+    if isinstance(response, _HTTP_RESPONSE_TYPES):
+        header_value = header_lookup(cast(Any, response).headers, key)
         if header_value is not None:
             return header_value
 

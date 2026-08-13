@@ -19,7 +19,7 @@ from typing import (
     overload,
 )
 
-import httpx
+import httpx2
 from openai import AsyncOpenAI, NotGiven, Omit, omit
 from openai.types import ChatModel
 from openai.types.responses import (
@@ -1356,7 +1356,7 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
         if timeout is None or _is_openai_omitted_value(timeout):
             return _WebsocketRequestTimeouts(lock=None, connect=None, send=None, recv=None)
 
-        if isinstance(timeout, httpx.Timeout):
+        if isinstance(timeout, httpx2.Timeout):
             return _WebsocketRequestTimeouts(
                 lock=None if timeout.pool is None else float(timeout.pool),
                 connect=None if timeout.connect is None else float(timeout.connect),
@@ -1478,7 +1478,7 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
 
     def _prepare_websocket_url(self, extra_query: Any) -> str:
         if self._client.websocket_base_url is not None:
-            base_url = httpx.URL(self._client.websocket_base_url)
+            base_url = httpx2.URL(self._client.websocket_base_url)
             ws_scheme = {"http": "ws", "https": "wss"}.get(base_url.scheme, base_url.scheme)
             base_url = base_url.copy_with(scheme=ws_scheme)
         else:

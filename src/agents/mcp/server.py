@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar, Union, cast
 
 import anyio
-import httpx
 
 if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup  # pyright: ignore[reportMissingImports]
@@ -307,7 +306,7 @@ def _create_default_streamable_http_client(
         kwargs["headers"] = headers
     if auth is not None:
         kwargs["auth"] = auth
-    return httpx.AsyncClient(**kwargs)
+    return MCP_HTTPX.AsyncClient(**kwargs)
 
 
 def _validate_v2_http_auth(auth: Any) -> None:
@@ -435,7 +434,7 @@ async def _streamablehttp_client_with_transport(
     sse_read_timeout: float | timedelta = 60 * 5,
     terminate_on_close: bool = True,
     httpx_client_factory: HttpClientFactory = _create_default_streamable_http_client,
-    auth: httpx.Auth | None = None,
+    auth: Any = None,
     transport_factory: Callable[[str], Any] = StreamableHTTPTransport,
 ) -> AsyncGenerator[MCPStreamTransport, None]:
     timeout_seconds = timeout.total_seconds() if isinstance(timeout, timedelta) else timeout
@@ -447,7 +446,7 @@ async def _streamablehttp_client_with_transport(
 
     client = httpx_client_factory(
         headers=headers,
-        timeout=httpx.Timeout(timeout_seconds, read=sse_read_timeout_seconds),
+        timeout=MCP_HTTPX.Timeout(timeout_seconds, read=sse_read_timeout_seconds),
         auth=auth,
     )
     transport = transport_factory(url)
