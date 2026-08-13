@@ -78,7 +78,12 @@ TranscriptionResult = str | Exception
 TTSResultItem = TTSResult | Sequence[bytes] | Exception
 WorkflowResult = str | Sequence[str] | Exception
 
-_START_NOT_CONFIGURED: Any = object()
+
+class _StartNotConfigured:
+    pass
+
+
+_START_NOT_CONFIGURED: Any = _StartNotConfigured()
 
 
 def _snapshot_audio_input(input: AudioInput) -> AudioInput:

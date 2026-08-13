@@ -101,6 +101,9 @@
     "modal": {
       "extra": "modal"
     },
+    "numpy": {
+      "extra": "voice"
+    },
     "pymongo": {
       "extra": "mongodb"
     },
@@ -170,6 +173,39 @@
         "VercelSandboxSession": "vercel",
         "VercelSandboxSessionState": "vercel"
       }
+    },
+    "agents.realtime.testing": {
+      "optional_bindings": {},
+      "optional_exports": {}
+    },
+    "agents.testing": {
+      "optional_bindings": {},
+      "optional_exports": {}
+    },
+    "agents.testing.model": {
+      "optional_bindings": {},
+      "optional_exports": {}
+    },
+    "agents.testing.sandbox": {
+      "optional_bindings": {},
+      "optional_exports": {}
+    },
+    "agents.voice.testing": {
+      "optional_bindings": {
+        "STTCall": "numpy",
+        "STTSessionCall": "numpy",
+        "ScriptedSTTModel": "numpy",
+        "ScriptedTTSModel": "numpy",
+        "ScriptedTranscriptionSession": "numpy",
+        "ScriptedVoiceWorkflow": "numpy",
+        "TTSCall": "numpy",
+        "TTSResult": "numpy",
+        "UnconsumedVoiceSteps": "numpy",
+        "UnexpectedVoiceCall": "numpy",
+        "VoiceScriptError": "numpy",
+        "pcm16_samples": "numpy"
+      },
+      "optional_exports": {}
     }
   },
   "public_properties": [

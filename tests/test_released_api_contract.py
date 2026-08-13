@@ -1,3 +1,5 @@
+import builtins
+import importlib
 import json
 import subprocess
 import sys
@@ -2330,6 +2332,65 @@ def test_repository_release_policy_declares_v020_contract_surfaces() -> None:
     )
 
 
+def test_repository_release_policy_declares_public_testing_modules() -> None:
+    policy = load_submodule_export_policy(CONTRACT.with_name("released_api_contract_policy.json"))
+    expected_modules = {
+        "agents.realtime.testing",
+        "agents.testing",
+        "agents.testing.model",
+        "agents.testing.sandbox",
+        "agents.voice.testing",
+    }
+
+    assert expected_modules <= policy.modules.keys()
+    assert policy.modules["agents.voice.testing"] == {
+        "optional_bindings": {
+            export: "numpy" for export in importlib.import_module("agents.voice.testing").__all__
+        },
+        "optional_exports": {},
+    }
+    assert (
+        next(
+            installation
+            for installation in policy.dependency_installations
+            if installation.dependency_module == "numpy"
+        ).extra
+        == "voice"
+    )
+    for module_name in expected_modules:
+        module = importlib.import_module(module_name)
+        assert module.__all__
+        assert all(type(export) is str for export in module.__all__)
+
+
+def test_voice_testing_start_sentinel_has_stable_contract_identity() -> None:
+    from agents.voice.testing import _START_NOT_CONFIGURED
+
+    assert _default_contract(_START_NOT_CONFIGURED) == {
+        "kind": "sentinel",
+        "identity": "agents.voice.testing._START_NOT_CONFIGURED",
+    }
+
+
+def test_default_contract_does_not_import_voice_testing_for_unrelated_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_import = builtins.__import__
+
+    def guarded_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "agents.voice.testing":
+            raise AssertionError("Unrelated defaults must not import the optional Voice package.")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    assert _default_contract(()) == {
+        "kind": "sequence",
+        "type": "builtins.tuple",
+        "items": [],
+    }
+
+
 @pytest.mark.parametrize(
     "unsupported_platforms",
     ["win32", [""], ["win32", "win32"]],
@@ -2418,6 +2479,37 @@ def test_public_api_contract_allows_declared_optional_submodule_binding(
             agents_module if module_name == "agents" else submodule
         ),
     )
+
+    assert validate_released_api_contract(contract, agents_module=agents_module) == []
+
+
+def test_public_api_contract_skips_fully_optional_unimportable_submodule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agents_module = SimpleNamespace(__all__=[])
+    contract: dict[str, Any] = {
+        "required_top_level_exports": [],
+        "public_modules": ["agents.optional_submodule"],
+        "required_submodule_exports": {
+            "agents.optional_submodule": {
+                "names": ["OptionalClient", "OptionalConfig"],
+                "optional_bindings": {
+                    "OptionalClient": "missing_optional_dependency",
+                    "OptionalConfig": "missing_optional_dependency",
+                },
+                "optional_exports": {},
+            }
+        },
+        "canonical_imports": [],
+        "callables": {},
+    }
+
+    def import_module(module_name: str, _agents_module: object) -> object:
+        if module_name == "agents":
+            return agents_module
+        raise ImportError("The optional dependency is unavailable.")
+
+    monkeypatch.setattr(contract_support, "_import_contract_module", import_module)
 
     assert validate_released_api_contract(contract, agents_module=agents_module) == []
 

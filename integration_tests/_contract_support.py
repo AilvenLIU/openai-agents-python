@@ -325,6 +325,12 @@ def _default_contract(value: object) -> dict[str, object]:
             "type": f"{type(value).__module__}.{type(value).__qualname__}",
             "value": value,
         }
+    value_type = f"{type(value).__module__}.{type(value).__qualname__}"
+    if value_type == "agents.voice.testing._StartNotConfigured":
+        return {
+            "kind": "sentinel",
+            "identity": "agents.voice.testing._START_NOT_CONFIGURED",
+        }
     from agents.mcp.server import _UNSET as mcp_failure_error_unset
     from agents.retry import _UNSET as retry_unset
     from agents.tool import _UNSET_FAILURE_ERROR_FUNCTION as failure_error_function_unset
@@ -339,7 +345,6 @@ def _default_contract(value: object) -> dict[str, object]:
     for sentinel, identity in sentinel_identities:
         if value is sentinel:
             return {"kind": "sentinel", "identity": identity}
-    value_type = f"{type(value).__module__}.{type(value).__qualname__}"
     if value_type == "pydantic.fields.FieldInfo":
         return {"kind": "repr", "type": value_type, "value": repr(value)}
     if isinstance(value, enum.Enum):
@@ -715,6 +720,27 @@ def _optional_dependency_for_binding_in_modules(
         dependency_module = module_contract.get(field_name, {}).get(binding_name)
         if dependency_module is not None:
             return cast(str, dependency_module)
+    return None
+
+
+def _optional_dependency_for_module_import(
+    contract: Mapping[str, Any], module_name: str
+) -> str | None:
+    modules = contract.get("required_submodule_exports", {})
+    module_contract = modules.get(module_name, {})
+    names = module_contract.get("names", [])
+    try:
+        optional_bindings = _optional_dependency_modules(
+            module_contract.get("optional_bindings", {}), field_name="optional_bindings"
+        )
+        optional_exports = _optional_dependency_modules(
+            module_contract.get("optional_exports", {}), field_name="optional_exports"
+        )
+    except ValueError:
+        return None
+    dependencies = {optional_bindings.get(name) or optional_exports.get(name) for name in names}
+    if names and len(dependencies) == 1 and None not in dependencies:
+        return cast(str, next(iter(dependencies)))
     return None
 
 
@@ -1265,6 +1291,13 @@ def validate_released_api_contract(
             imported_modules[module_name] = _import_contract_module(module_name, agents_module)
         except Exception as error:
             if _matches_platform_import_error(contract, module_name, error):
+                continue
+            optional_dependency = _optional_dependency_for_module_import(contract, module_name)
+            if optional_dependency is not None and not (
+                _optional_dependency_is_available_for_contract(
+                    optional_dependency, unsupported_platforms
+                )
+            ):
                 continue
             errors.append(f"Failed to import released module {module_name}: {error!r}")
 
