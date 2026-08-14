@@ -6,6 +6,7 @@ import asyncio
 import copy
 import dataclasses
 import json
+import math
 import threading
 from collections import deque
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
@@ -23,6 +24,7 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
+from openai.types.responses.response_function_tool_call import CallerDirect, CallerProgram
 from openai.types.responses.response_input_param import (
     ComputerCallOutput,
     FunctionCallOutput,
@@ -31,12 +33,22 @@ from openai.types.responses.response_input_param import (
 )
 from openai.types.responses.response_output_item import (
     LocalShellCall,
+    LocalShellCallAction,
     McpApprovalRequest,
+    McpCall,
     McpListTools,
     Program,
     ProgramOutput,
 )
-from pydantic import StringConstraints, TypeAdapter, ValidationError
+from pydantic import (
+    BaseModel,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
+    StringConstraints,
+    TypeAdapter,
+    ValidationError,
+    model_serializer,
+)
 from typing_extensions import TypedDict, TypeVar
 
 from ._tool_identity import (
@@ -244,13 +256,239 @@ _TOOL_CALL_OUTPUT_UNION_ADAPTER: TypeAdapter[
 _MCP_APPROVAL_RESPONSE_ADAPTER: TypeAdapter[McpApprovalResponse] = TypeAdapter(McpApprovalResponse)
 _HANDOFF_OUTPUT_ADAPTER: TypeAdapter[TResponseInputItem] = TypeAdapter(TResponseInputItem)
 _LOCAL_SHELL_CALL_ADAPTER: TypeAdapter[LocalShellCall] = TypeAdapter(LocalShellCall)
+_PYDANTIC_DICT_SLOT: Any = BaseModel.__dict__["__dict__"]
+_PYDANTIC_FIELDS_SET_SLOT: Any = BaseModel.__dict__["__pydantic_fields_set__"]
+_PYDANTIC_EXTRA_SLOT: Any = BaseModel.__dict__["__pydantic_extra__"]
 _MISSING_CONTEXT_SENTINEL = object()
 _ALLOWED_MISSING_MESSAGE_FIELDS = frozenset({"status"})
+
+
+def _remove_unset_snapshot_extras(value: Any, dumped: Any) -> None:
+    """Restore source exclude-unset semantics for copied subtype fields."""
+    if isinstance(value, BaseModel) and type(dumped) is dict:
+        storage = _PYDANTIC_DICT_SLOT.__get__(value, BaseModel)
+        fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(value, BaseModel)
+        extra = _PYDANTIC_EXTRA_SLOT.__get__(value, BaseModel)
+        if type(storage) is not dict or type(fields_set) is not set:
+            raise TypeError("Unsupported detached tool approval model storage")
+        if extra is not None and type(extra) is not dict:
+            raise TypeError("Unsupported detached tool approval extra-field storage")
+        if extra is not None:
+            for field_name, field_value in dict.items(extra):
+                if field_name not in fields_set:
+                    dumped.pop(field_name, None)
+                elif field_name in dumped:
+                    _remove_unset_snapshot_extras(field_value, dumped[field_name])
+        for field_name, field_value in dict.items(storage):
+            if field_name in dumped:
+                _remove_unset_snapshot_extras(field_value, dumped[field_name])
+        return
+    if type(value) is list and type(dumped) is list:
+        for source_item, dumped_item in zip(value, dumped, strict=False):
+            _remove_unset_snapshot_extras(source_item, dumped_item)
+        return
+    if type(value) is tuple and type(dumped) is list:
+        for source_item, dumped_item in zip(value, dumped, strict=False):
+            _remove_unset_snapshot_extras(source_item, dumped_item)
+        return
+    if type(value) is dict and type(dumped) is dict:
+        for key, source_item in dict.items(value):
+            if key in dumped:
+                _remove_unset_snapshot_extras(source_item, dumped[key])
+
+
+class _DetachedApprovalModelMixin:
+    """Keep copied subtype defaults visible without changing canonical identity."""
+
+    @model_serializer(mode="wrap")
+    def _serialize_detached_approval(
+        self,
+        handler: SerializerFunctionWrapHandler,
+        info: SerializationInfo,
+    ) -> Any:
+        dumped = handler(self)
+        if info.exclude_unset:
+            _remove_unset_snapshot_extras(self, dumped)
+        return dumped
+
+
+class _DetachedResponseFunctionToolCall(
+    _DetachedApprovalModelMixin,
+    ResponseFunctionToolCall,
+):
+    pass
+
+
+class _DetachedMcpCall(_DetachedApprovalModelMixin, McpCall):
+    pass
+
+
+class _DetachedMcpApprovalRequest(_DetachedApprovalModelMixin, McpApprovalRequest):
+    pass
+
+
+class _DetachedLocalShellCall(_DetachedApprovalModelMixin, LocalShellCall):
+    pass
+
+
+class _DetachedCallerDirect(_DetachedApprovalModelMixin, CallerDirect):
+    pass
+
+
+class _DetachedCallerProgram(_DetachedApprovalModelMixin, CallerProgram):
+    pass
+
+
+class _DetachedLocalShellCallAction(_DetachedApprovalModelMixin, LocalShellCallAction):
+    pass
 
 
 def _deserialize_tool_origin(data: Any) -> ToolOrigin | None:
     """Best-effort deserialization for optional tool origin metadata."""
     return ToolOrigin.from_json_dict(data)
+
+
+def _copy_model_field_data(
+    value: Any,
+    active_container_ids: set[int],
+) -> tuple[dict[str, Any], set[str]]:
+    """Copy declared Pydantic fields without invoking hooks on a model subclass."""
+    value_id = id(value)
+    if value_id in active_container_ids:
+        raise TypeError("Cyclic tool approval payload")
+    active_container_ids.add(value_id)
+    try:
+        storage = _PYDANTIC_DICT_SLOT.__get__(value, BaseModel)
+        if type(storage) is not dict:
+            raise TypeError("Unsupported tool approval model storage")
+        fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(value, BaseModel)
+        if type(fields_set) is not set:
+            raise TypeError("Unsupported tool approval field-set storage")
+        present_fields: set[str] = set()
+        for field_name in set.__iter__(fields_set):
+            if not isinstance(field_name, str):
+                raise TypeError("Non-string field name in tool approval payload")
+            normalized_field_name = str.__str__(field_name)
+            if normalized_field_name in present_fields:
+                raise TypeError("Colliding field name in tool approval payload")
+            present_fields.add(normalized_field_name)
+        copied: dict[str, Any] = {}
+        for field_name, field_value in dict.items(storage):
+            if not isinstance(field_name, str):
+                raise TypeError("Non-string field name in tool approval payload")
+            normalized_field_name = str.__str__(field_name)
+            if normalized_field_name in copied:
+                raise TypeError("Colliding field name in tool approval payload")
+            copied[normalized_field_name] = _copy_json_compatible_value(
+                field_value,
+                active_container_ids,
+            )
+        extra = _PYDANTIC_EXTRA_SLOT.__get__(value, BaseModel)
+        if extra is not None:
+            if type(extra) is not dict:
+                raise TypeError("Unsupported tool approval extra-field storage")
+            for field_name, field_value in dict.items(extra):
+                if not isinstance(field_name, str):
+                    raise TypeError("Unsafe extra field in tool approval payload")
+                normalized_field_name = str.__str__(field_name)
+                if normalized_field_name in copied:
+                    raise TypeError("Unsafe extra field in tool approval payload")
+                copied[normalized_field_name] = _copy_json_compatible_value(
+                    field_value,
+                    active_container_ids,
+                )
+        return copied, present_fields
+    finally:
+        active_container_ids.remove(value_id)
+
+
+def _copy_json_compatible_value(value: Any, active_container_ids: set[int]) -> Any:
+    """Copy bounded JSON-shaped data without invoking container or model hooks."""
+    if value is None or type(value) is bool:
+        return value
+    if isinstance(value, str):
+        return str.__str__(value)
+    if isinstance(value, int):
+        return int.__int__(value)
+    if isinstance(value, float):
+        copied_float = float.__float__(value)
+        if not math.isfinite(copied_float):
+            raise TypeError("Non-finite number in tool approval payload")
+        return copied_float
+    if isinstance(value, CallerDirect):
+        return _copy_model_as_type(value, _DetachedCallerDirect, active_container_ids)
+    if isinstance(value, CallerProgram):
+        return _copy_model_as_type(value, _DetachedCallerProgram, active_container_ids)
+    if isinstance(value, LocalShellCallAction):
+        return _copy_model_as_type(value, _DetachedLocalShellCallAction, active_container_ids)
+
+    value_id = id(value)
+    if value_id in active_container_ids:
+        raise TypeError("Cyclic tool approval payload")
+    if isinstance(value, dict):
+        active_container_ids.add(value_id)
+        try:
+            copied_dict: dict[str, Any] = {}
+            for key, item in dict.items(value):
+                if not isinstance(key, str):
+                    raise TypeError("Non-string key in tool approval payload")
+                normalized_key = str.__str__(key)
+                if normalized_key in copied_dict:
+                    raise TypeError("Colliding key in tool approval payload")
+                copied_dict[normalized_key] = _copy_json_compatible_value(
+                    item,
+                    active_container_ids,
+                )
+            return copied_dict
+        finally:
+            active_container_ids.remove(value_id)
+    if isinstance(value, list):
+        active_container_ids.add(value_id)
+        try:
+            return [
+                _copy_json_compatible_value(item, active_container_ids)
+                for item in list.__iter__(value)
+            ]
+        finally:
+            active_container_ids.remove(value_id)
+    if isinstance(value, tuple):
+        active_container_ids.add(value_id)
+        try:
+            return [
+                _copy_json_compatible_value(item, active_container_ids)
+                for item in tuple.__iter__(value)
+            ]
+        finally:
+            active_container_ids.remove(value_id)
+    raise TypeError("Unsupported value in tool approval payload")
+
+
+def _copy_model_as_type(value: Any, model_type: type[Any], active_container_ids: set[int]) -> Any:
+    """Canonicalize a model while preserving which source fields were explicitly set."""
+    copied_data, source_fields_set = _copy_model_field_data(value, active_container_ids)
+    copied_model = model_type.model_validate(copied_data)
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(copied_model, source_fields_set)
+    return copied_model
+
+
+def _copy_tool_approval_raw_item(raw_item: Any) -> Any:
+    """Copy a supported approval raw item through SDK-owned model types."""
+    active_container_ids: set[int] = set()
+    if isinstance(raw_item, ResponseFunctionToolCall):
+        return _copy_model_as_type(
+            raw_item,
+            _DetachedResponseFunctionToolCall,
+            active_container_ids,
+        )
+    if isinstance(raw_item, McpCall):
+        return _copy_model_as_type(raw_item, _DetachedMcpCall, active_container_ids)
+    if isinstance(raw_item, McpApprovalRequest):
+        return _copy_model_as_type(raw_item, _DetachedMcpApprovalRequest, active_container_ids)
+    if isinstance(raw_item, LocalShellCall):
+        return _copy_model_as_type(raw_item, _DetachedLocalShellCall, active_container_ids)
+    if isinstance(raw_item, dict):
+        return _copy_json_compatible_value(raw_item, active_container_ids)
+    raise TypeError("Unsupported tool approval raw item")
 
 
 @dataclass
@@ -452,13 +690,38 @@ class RunState(Generic[TContext, TAgent]):
         self._pending_input = []
 
     def get_interruptions(self) -> list[ToolApprovalItem]:
-        """Return pending interruptions if the current step is an interruption."""
+        """Return detached copies of pending interruptions for the current step."""
         # Import at runtime to avoid circular import
         from .run_internal.run_steps import NextStepInterruption
 
         if self._current_step is None or not isinstance(self._current_step, NextStepInterruption):
             return []
-        return list(self._current_step.interruptions)
+        copy_error: UserError | None = None
+        try:
+            interruptions: list[ToolApprovalItem] = []
+            for item in self._current_step.interruptions:
+                copied_raw_item = _copy_tool_approval_raw_item(item.raw_item)
+                interruptions.append(
+                    dataclasses.replace(
+                        item,
+                        agent=item.agent,
+                        raw_item=copied_raw_item,
+                    )
+                )
+        except Exception as error:
+            _prepare_data_redacted_error(error)
+            copy_error = UserError(
+                "Cannot safely copy pending tool approvals. Ensure each interruption uses a "
+                "supported tool call or contains only JSON-compatible mapping data."
+            )
+        if copy_error is not None:
+            _mark_error_data_redacted(copy_error)
+            self = cast(Any, None)
+            item = cast(Any, None)
+            copied_raw_item = None
+            interruptions = []
+            _raise_data_redacted_error(copy_error)
+        return interruptions
 
     @staticmethod
     def _approval_items_match(
