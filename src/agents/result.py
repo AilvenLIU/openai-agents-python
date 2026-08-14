@@ -706,12 +706,20 @@ class RunResultStreaming(RunResultBase):
         async def _await_run_and_cleanup() -> Any:
             try:
                 result = await original_task
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
                 if not original_task.done():
                     original_task.cancel()
+                if _is_error_data_redacted(error):
+                    _detach_data_redacted_error_traceback(error)
                 raise
-            except Exception:
+            except Exception as error:
                 await self._run_sandbox_cleanup()
+                if _is_error_data_redacted(error):
+                    _detach_data_redacted_error_traceback(error)
+                raise
+            except BaseException as error:
+                if _is_error_data_redacted(error):
+                    _detach_data_redacted_error_traceback(error)
                 raise
 
             await self._run_sandbox_cleanup()
@@ -743,7 +751,7 @@ class RunResultStreaming(RunResultBase):
         if task is None or not task.done() or task.cancelled():
             return None
         error = task.exception()
-        if isinstance(error, Exception) and _is_error_data_redacted(error):
+        if error is not None and _is_error_data_redacted(error):
             _detach_data_redacted_error_traceback(error)
         return error
 

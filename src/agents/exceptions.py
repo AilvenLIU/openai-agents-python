@@ -188,10 +188,34 @@ def _prepare_data_redacted_error(
     return safe_error
 
 
-def _replace_data_redacted_process_control_error(
+def _base_exception_group_exceptions(
+    error: BaseException,
+) -> tuple[BaseException, ...] | None:
+    """Read exception-group children without invoking subclass descriptors."""
+    if not issubclass(type(error), BaseExceptionGroup):
+        return None
+    try:
+        if sys.version_info < (3, 11):
+            state = _base_exception_instance_dict(error)
+            raw_exceptions = (
+                _exact_string_state_value(state, "_exceptions") if state is not None else None
+            )
+        else:
+            descriptor = type.__getattribute__(BaseExceptionGroup, "__dict__")["exceptions"]
+            raw_exceptions = descriptor.__get__(error, type(error))
+    except BaseException:
+        return None
+    if type(raw_exceptions) is not tuple:
+        return None
+    if not all(issubclass(type(candidate), BaseException) for candidate in raw_exceptions):
+        return None
+    return cast(tuple[BaseException, ...], raw_exceptions)
+
+
+def _copy_data_redacted_process_control_error(
     error: BaseException,
 ) -> BaseException | None:
-    """Discard a process-control source and return a fresh value-free replacement."""
+    """Return a fresh process-control replacement without mutating the source."""
     error_type = type(error)
     if issubclass(error_type, asyncio.CancelledError):
         safe_error: BaseException | None = asyncio.CancelledError()
@@ -217,11 +241,21 @@ def _replace_data_redacted_process_control_error(
                 safe_error = SystemExit(effective_code)
 
     assert safe_error is not None
-    _discard_exception_graph(error)
     try:
         _mark_error_data_redacted(safe_error)
     except BaseException:
         pass
+    return safe_error
+
+
+def _replace_data_redacted_process_control_error(
+    error: BaseException,
+) -> BaseException | None:
+    """Discard a process-control source and return a fresh value-free replacement."""
+    safe_error = _copy_data_redacted_process_control_error(error)
+    if safe_error is None:
+        return None
+    _discard_exception_graph(error)
     return safe_error
 
 
@@ -268,30 +302,9 @@ def _discard_exception_graph(error: BaseException) -> None:
         group_exceptions: tuple[BaseException, ...] | None = None
         current_type = type(current)
         if issubclass(current_type, BaseExceptionGroup):
-            try:
-                if sys.version_info < (3, 11):
-                    group_state = _base_exception_instance_dict(current)
-                    raw_group_exceptions = (
-                        _exact_string_state_value(group_state, "_exceptions")
-                        if group_state is not None
-                        else None
-                    )
-                else:
-                    group_descriptor = type.__getattribute__(BaseExceptionGroup, "__dict__")[
-                        "exceptions"
-                    ]
-                    raw_group_exceptions = group_descriptor.__get__(current, current_type)
-                if type(raw_group_exceptions) is tuple:
-                    group_exceptions = tuple(
-                        cast(BaseException, candidate)
-                        for candidate in raw_group_exceptions
-                        if issubclass(type(candidate), BaseException)
-                    )
-                else:
-                    group_exceptions = ()
+            group_exceptions = _base_exception_group_exceptions(current)
+            if group_exceptions is not None:
                 linked.extend(group_exceptions)
-            except BaseException:
-                pass
         for descriptor in (
             cast(Any, BaseException.__cause__),
             cast(Any, BaseException.__context__),

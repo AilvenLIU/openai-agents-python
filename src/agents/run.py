@@ -80,10 +80,7 @@ from .run_internal.approvals import approvals_from_step
 from .run_internal.error_handlers import (
     attach_generic_agent_error,
     build_run_error_data,
-    create_message_output_item,
-    format_final_output_text,
     resolve_run_error_handler_result,
-    validate_handler_final_output,
 )
 from .run_internal.items import (
     copy_input_items,
@@ -96,11 +93,11 @@ from .run_internal.run_grouping import resolve_run_grouping_id
 from .run_internal.run_loop import (
     _retained_items_for_blocked_output,
     cleanup_models_after_run,
+    finalize_max_turns_handler_output,
     get_all_tools,
     get_output_schema,
     initialize_computer_tools,
     resolve_interrupted_turn,
-    run_final_output_hooks,
     run_input_guardrails,
     run_output_guardrails,
     run_single_turn,
@@ -285,7 +282,7 @@ class Runner:
         """
 
         runner = DEFAULT_AGENT_RUNNER
-        redacted_error: AgentsException | None = None
+        redacted_error: BaseException | None = None
         try:
             return await runner.run(
                 starting_agent,
@@ -300,7 +297,7 @@ class Runner:
                 conversation_id=conversation_id,
                 session=session,
             )
-        except AgentsException as error:
+        except BaseException as error:
             if not _is_error_data_redacted(error):
                 raise
             _detach_data_redacted_error_traceback(error)
@@ -388,7 +385,7 @@ class Runner:
         """
 
         runner = DEFAULT_AGENT_RUNNER
-        redacted_error: AgentsException | None = None
+        redacted_error: BaseException | None = None
         try:
             return runner.run_sync(
                 starting_agent,
@@ -403,7 +400,7 @@ class Runner:
                 session=session,
                 auto_previous_response_id=auto_previous_response_id,
             )
-        except AgentsException as error:
+        except BaseException as error:
             if not _is_error_data_redacted(error):
                 raise
             _detach_data_redacted_error_traceback(error)
@@ -829,7 +826,9 @@ class AgentRunner:
 
                 # Output guardrails run once, at the end of the run. Accumulate their results
                 # here so the failure handler below can report them on the raised exception.
-                output_guardrail_results: list[OutputGuardrailResult] = []
+                output_guardrail_results: list[OutputGuardrailResult] = (
+                    list(run_state._output_guardrail_results) if run_state is not None else []
+                )
                 tool_input_guardrail_results: list[ToolInputGuardrailResult] = (
                     list(getattr(run_state, "_tool_input_guardrail_results", []))
                     if run_state is not None
@@ -1278,29 +1277,51 @@ class AgentRunner:
                         if handler_result is None:
                             raise max_turns_error
 
-                        validated_output = validate_handler_final_output(
-                            current_agent, handler_result.final_output
-                        )
-                        output_text = format_final_output_text(current_agent, validated_output)
-                        synthesized_item = create_message_output_item(current_agent, output_text)
                         include_in_history = handler_result.include_in_history
-                        if include_in_history:
-                            generated_items.append(synthesized_item)
-                            session_items.append(synthesized_item)
+                        handler_output_recorded = False
+                        handler_persisted_item_count = 0
 
-                        await run_final_output_hooks(
-                            current_agent,
-                            hooks,
-                            context_wrapper,
+                        async def _save_max_turns_handler_output(
+                            items: list[RunItem],
+                            store_setting: bool | None = store_setting,
+                            generated_items: list[RunItem] = generated_items,
+                            session_items: list[RunItem] = session_items,
+                        ) -> None:
+                            nonlocal handler_output_recorded, handler_persisted_item_count
+                            handler_persisted_item_count = (
+                                await save_final_turn_items_after_guardrails(
+                                    session=session,
+                                    run_state=None,
+                                    session_persistence_enabled=session_persistence_enabled,
+                                    input_guardrail_results=_attempt_input_guardrail_results(),
+                                    items=items,
+                                    response_id=None,
+                                    reasoning_item_id_policy=resolved_reasoning_item_id_policy,
+                                    store=store_setting,
+                                    wrapper=context_wrapper,
+                                )
+                            )
+                            if not items:
+                                return
+                            generated_items.extend(items)
+                            session_items.extend(items)
+                            handler_output_recorded = True
+
+                        (
                             validated_output,
+                            synthesized_item,
+                        ) = await finalize_max_turns_handler_output(
+                            agent=current_agent,
+                            hooks=hooks,
+                            run_config=run_config,
+                            output=handler_result.final_output,
+                            context_wrapper=context_wrapper,
+                            output_guardrail_results=output_guardrail_results,
+                            save_items_after_guardrails=_save_max_turns_handler_output,
+                            include_in_history=include_in_history,
                         )
-                        await run_output_guardrails(
-                            current_agent.output_guardrails + (run_config.output_guardrails or []),
-                            current_agent,
-                            validated_output,
-                            context_wrapper,
-                            output_guardrail_results,
-                        )
+                        if include_in_history and not handler_output_recorded:
+                            await _save_max_turns_handler_output([synthesized_item])
                         current_step = getattr(run_state, "_current_step", None)
                         approvals_from_state = approvals_from_step(current_step)
                         result = RunResult(
@@ -1325,27 +1346,7 @@ class AgentRunner:
                         )
                         if run_state is not None:
                             result._trace_state = run_state._trace_state
-                        if session_persistence_enabled and include_in_history:
-                            handler_input_items_for_save: list[TResponseInputItem] = (
-                                session_input_items_for_persistence
-                                if session_input_items_for_persistence is not None
-                                else []
-                            )
-                            # The synthesized item is a fresh one-item list, not the
-                            # cumulative turn item list, so the run state's per-turn
-                            # persisted count must not be applied as a slice offset here.
-                            # Pass the reasoning item id policy explicitly instead, the same
-                            # way `save_resumed_turn_items` does.
-                            await save_result_to_session(
-                                session,
-                                handler_input_items_for_save,
-                                [synthesized_item],
-                                None,
-                                response_id=None,
-                                reasoning_item_id_policy=resolved_reasoning_item_id_policy,
-                                store=store_setting,
-                                wrapper=context_wrapper,
-                            )
+                        result._current_turn_persisted_item_count = handler_persisted_item_count
                         result._original_input = copy_input_items(original_input)
                         return _finalize_result(result)
 
@@ -1796,15 +1797,15 @@ class AgentRunner:
                         turn_result.new_step_items.clear()
             except BaseException as exc:
                 run_exception = exc
-                attach_generic_agent_error(
-                    current_span,
-                    exc,
-                    trace_include_sensitive_data=run_config.trace_include_sensitive_data,
-                )
-                if isinstance(exc, AgentsException):
-                    if _is_error_data_redacted(exc):
-                        _detach_data_redacted_error_traceback(exc)
-                    else:
+                if _is_error_data_redacted(exc):
+                    _detach_data_redacted_error_traceback(exc)
+                else:
+                    attach_generic_agent_error(
+                        current_span,
+                        exc,
+                        trace_include_sensitive_data=run_config.trace_include_sensitive_data,
+                    )
+                    if isinstance(exc, AgentsException):
                         _clear_data_redacted_error_traceback(exc)
                         exc.run_data = RunErrorDetails(
                             input=original_input,
@@ -1948,7 +1949,7 @@ class AgentRunner:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     default_loop.run_until_complete(task)
-            if isinstance(error, ModelBehaviorError):
+            if _is_error_data_redacted(error) or isinstance(error, ModelBehaviorError):
                 _detach_data_redacted_error_traceback(error)
             raise
         finally:
