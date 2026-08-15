@@ -1,6 +1,6 @@
 # RunState compatibility corpus
 
-The `minimal/` fixtures cover every schema version accepted by the current reader. The `features/` fixtures cover the schema-bearing behavior introduced in versions 1.2 through 1.15. The `resume/` fixture records an actual pending function-tool approval emitted by the v0.19.4 writer, and the `security/` fixture records that writer's credential-bearing sandbox state. `sources.json` records the source commit and provenance for every fixture.
+The `minimal/` fixtures cover every schema version accepted by the current reader. The `features/` fixtures cover the schema-bearing behavior introduced in versions 1.2 through 1.16. The `resume/` fixture records an actual pending function-tool approval emitted by the v0.19.4 writer, and the `security/` fixture records that writer's credential-bearing sandbox state. `sources.json` records the source commit and provenance for every fixture.
 
 Regenerate the feature corpus from the recorded historical source trees with:
 

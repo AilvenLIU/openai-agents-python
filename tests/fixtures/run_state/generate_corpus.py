@@ -12,6 +12,7 @@ from typing import cast
 
 ROOT = Path(__file__).resolve().parents[3]
 OUTPUT = Path(__file__).resolve().parent / "features"
+MINIMAL_OUTPUT = Path(__file__).resolve().parent / "minimal"
 SECURITY_OUTPUT = Path(__file__).resolve().parent / "security"
 RESUME_OUTPUT = Path(__file__).resolve().parent / "resume"
 
@@ -387,6 +388,40 @@ approval = ToolApprovalItem(
 state.approve(approval)
 """,
     ),
+    Scenario(
+        "1.16",
+        "944d19474d6e5e67fa6ad29b744d464e43acd1cf",
+        "per_call_approval_override",
+        """
+from agents.items import ToolApprovalItem
+from openai.types.responses import ResponseFunctionToolCall
+
+def approval(call_id):
+    return ToolApprovalItem(
+        agent=agent,
+        raw_item=ResponseFunctionToolCall(
+            type="function_call",
+            name="sensitive_tool",
+            call_id=call_id,
+            status="completed",
+            arguments="{}",
+        ),
+    )
+
+state.approve(approval("sticky-call"), always_approve=True)
+state.reject(approval("exception-call"), rejection_message="Denied exactly")
+""",
+    ),
+)
+
+
+MINIMAL_SCENARIOS = (
+    Scenario(
+        "1.16",
+        "944d19474d6e5e67fa6ad29b744d464e43acd1cf",
+        "minimal",
+        "",
+    ),
 )
 
 
@@ -556,6 +591,19 @@ def main() -> None:
     sources_path = OUTPUT.parent / "sources.json"
     sources = json.loads(sources_path.read_text(encoding="utf-8"))
     sources["features"] = feature_sources
+
+    MINIMAL_OUTPUT.mkdir(parents=True, exist_ok=True)
+    for scenario in MINIMAL_SCENARIOS:
+        minimal_payload = _generate(scenario)
+        minimal_filename = f"v{scenario.version.replace('.', '_')}.json"
+        (MINIMAL_OUTPUT / minimal_filename).write_text(
+            json.dumps(minimal_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        sources["versions"][scenario.version] = {
+            "commit": scenario.commit,
+            "fixture": f"minimal/{minimal_filename}",
+        }
 
     SECURITY_OUTPUT.mkdir(parents=True, exist_ok=True)
     security_payload = _generate(LEGACY_MOUNT_CREDENTIALS)
