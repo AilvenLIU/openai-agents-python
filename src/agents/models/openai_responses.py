@@ -82,7 +82,10 @@ from ..usage import (
     _response_usage_to_usage,
     model_usage_to_span_usage,
 )
-from ..util._error_tracing import record_model_error_on_span
+from ..util._error_tracing import (
+    record_current_task_model_timeout_on_span,
+    record_model_error_on_span,
+)
 from ..util._json import _to_dump_compatible
 from ..version import __version__
 from ._openai_retry import get_openai_retry_advice
@@ -539,6 +542,13 @@ class OpenAIResponsesModel(Model):
                 if tracing.include_data():
                     span_response.span_data.response = response
                     span_response.span_data.input = input
+            except asyncio.CancelledError:
+                record_current_task_model_timeout_on_span(
+                    span_response,
+                    message="Error getting response",
+                    trace_include_sensitive_data=tracing.include_data(),
+                )
+                raise
             except Exception as e:
                 span_response.set_error(
                     SpanError(
@@ -674,6 +684,13 @@ class OpenAIResponsesModel(Model):
                         _response_usage_to_usage(final_response.usage)
                     )
 
+            except asyncio.CancelledError:
+                record_current_task_model_timeout_on_span(
+                    span_response,
+                    message="Error streaming response",
+                    trace_include_sensitive_data=tracing.include_data(),
+                )
+                raise
             except Exception as e:
                 span_response.set_error(
                     SpanError(
