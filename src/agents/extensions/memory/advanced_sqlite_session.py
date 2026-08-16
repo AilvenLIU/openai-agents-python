@@ -7,7 +7,7 @@ import sqlite3
 import time
 from contextlib import closing
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 from agents.result import RunResult
 from agents.usage import Usage
@@ -67,15 +67,18 @@ class AdvancedSQLiteSession(SQLiteSession):
             session_settings=session_settings,
             **kwargs,
         )
-        if create_tables:
-            try:
+        try:
+            if create_tables:
                 self._init_structure_tables()
+            else:
+                with self._locked_connection() as conn:
+                    self._claim_structure_tables(conn)
+        except BaseException:
+            try:
+                self.close()
             except BaseException:
-                try:
-                    self.close()
-                except BaseException:
-                    pass
-                raise
+                pass
+            raise
         self._current_branch_id = "main"
         # Synchronized with the durable session_clear_generations row whenever a
         # branch pointer is established or a write begins. A mismatch means
@@ -108,6 +111,73 @@ class AdvancedSQLiteSession(SQLiteSession):
             self._current_branch_id = branch_id
             return True
 
+    # The structure tables that record which base-table pair owns a database file, and the
+    # foreign keys that record it. `branch_reservations` and `session_clear_generations` carry no
+    # foreign keys, but enforcing one pair per file keeps them unambiguous too.
+    _STRUCTURE_TABLE_OWNERS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "message_structure": ("session_id", "message_id"),
+        "turn_usage": ("session_id",),
+    }
+    _OWNER_TARGET_COLUMNS: ClassVar[dict[str, str]] = {
+        "session_id": "session_id",
+        "message_id": "id",
+    }
+
+    def _claim_structure_tables(self, conn: sqlite3.Connection) -> None:
+        """Require a complete structure-table layout owned by the configured base-table pair.
+
+        The structure tables are not named after ``sessions_table``/``messages_table``, so a
+        database file can only hold the structure rows of a single pair. ``CREATE TABLE IF NOT
+        EXISTS`` keeps the first pair's foreign keys, so a second session configured with
+        different base table names would join ``message_structure`` against the wrong messages
+        table and read back rows that belong to the other pair.
+
+        Missing or ambiguous ownership is rejected rather than accepted, so a
+        ``create_tables=False`` session cannot open a file before any pair has claimed it and
+        then have another pair claim it underneath.
+        """
+        owned_by = {"session_id": self.sessions_table, "message_id": self.messages_table}
+        for table, columns in self._STRUCTURE_TABLE_OWNERS.items():
+            foreign_keys = conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+            owner_rows = {
+                column: [row for row in foreign_keys if row[3] == column] for column in columns
+            }
+            if any(len(owner_rows[column]) != 1 for column in columns):
+                raise ValueError(
+                    f"The `{table}` table in {self.db_path} does not record exactly one owner "
+                    "foreign key for each required base-table column. Construct an "
+                    "AdvancedSQLiteSession with create_tables=True to create and claim the "
+                    "structure tables before opening the database without them."
+                )
+
+            if any(
+                not self._identifiers_equal(conn, owner_rows[column][0][2], owned_by[column])
+                or not self._identifiers_equal(
+                    conn, owner_rows[column][0][4], self._OWNER_TARGET_COLUMNS[column]
+                )
+                for column in columns
+            ):
+                found = "/".join(
+                    f"{owner_rows[column][0][2]}({owner_rows[column][0][4]})" for column in columns
+                )
+                configured = "/".join(owned_by[column] for column in columns)
+                raise ValueError(
+                    f"The `{table}` table in {self.db_path} already belongs to '{found}', not to "
+                    f"the configured '{configured}'. Structure tables are shared per database "
+                    "file, so give each sessions_table/messages_table pair its own db_path."
+                )
+
+    @staticmethod
+    def _identifiers_equal(conn: sqlite3.Connection, left: str, right: str) -> bool:
+        """Compare two table names the way SQLite compares identifiers.
+
+        SQLite folds identifiers with ASCII rules only, so `NOCASE` is asked directly rather than
+        reimplemented. Python's ``casefold()`` would equate names SQLite keeps distinct, for
+        example ``ßsessions`` and ``sssessions``.
+        """
+        row = conn.execute("SELECT ? = ? COLLATE NOCASE", (left, right)).fetchone()
+        return bool(row[0])
+
     def _init_structure_tables(self):
         """Add structure and usage tracking tables.
 
@@ -116,6 +186,11 @@ class AdvancedSQLiteSession(SQLiteSession):
         and usage analytics.
         """
         with self._write_connection() as conn:
+            # Take the database write lock before the first CREATE so two processes cannot each
+            # create part of the layout for a different base-table pair. Python's sqlite3 keeps
+            # DDL inside the open transaction, so the checked layout commits as one unit.
+            conn.execute("BEGIN IMMEDIATE")
+
             # Message structure with branch support
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS message_structure (
@@ -155,6 +230,9 @@ class AdvancedSQLiteSession(SQLiteSession):
                     UNIQUE(session_id, branch_id, user_turn_number)
                 )
             """)
+
+            # Validate the owner-bearing tables before any helper queries or indexes consume them.
+            self._claim_structure_tables(conn)
 
             self._ensure_branch_reservations_table(conn)
             self._ensure_session_clear_generations_table(conn)
