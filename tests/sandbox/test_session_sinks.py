@@ -61,6 +61,7 @@ def _build_unix_local_session(
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_sandbox_session_exec_emits_stdout_when_enabled(tmp_path: Path) -> None:
     events: list[SandboxSessionEvent] = []
     instrumentation = Instrumentation(
@@ -198,6 +199,7 @@ async def test_chained_sink_runs_in_order(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_workspace_jsonl_sink_writes_into_workspace_and_persists(tmp_path: Path) -> None:
     inner = _build_unix_local_session(tmp_path)
     instrumentation = Instrumentation(
@@ -219,6 +221,7 @@ async def test_workspace_jsonl_sink_writes_into_workspace_and_persists(tmp_path:
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_workspace_jsonl_sink_supports_session_id_template(tmp_path: Path) -> None:
     inner = _build_unix_local_session(tmp_path)
     relpath = Path("logs/events-{session_id}.jsonl")
@@ -335,6 +338,7 @@ async def test_workspace_jsonl_sink_clears_flushed_buffer(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_workspace_jsonl_sink_ephemeral_excludes_runtime_outbox_with_existing_parent(
     tmp_path: Path,
 ) -> None:
@@ -373,6 +377,7 @@ async def test_workspace_jsonl_sink_ephemeral_excludes_runtime_outbox_with_exist
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_workspace_jsonl_sink_flushes_on_stop_when_flush_every_gt_one(
     tmp_path: Path,
 ) -> None:
@@ -403,6 +408,7 @@ async def test_workspace_jsonl_sink_flushes_on_stop_when_flush_every_gt_one(
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_callback_sink_receives_bound_inner_session(tmp_path: Path) -> None:
     inner = _build_unix_local_session(tmp_path)
     seen: list[tuple[str, BaseSandboxSession]] = []
@@ -583,6 +589,7 @@ async def test_expected_read_span_records_finish_sink_failure(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_exec_span_records_cancellation_during_finish_sink_delivery(tmp_path: Path) -> None:
     finish_delivery_started = asyncio.Event()
     completed_exit_codes: list[int] = []
@@ -622,6 +629,7 @@ async def test_exec_span_records_cancellation_during_finish_sink_delivery(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_sandbox_session_ops_nest_under_sdk_trace_and_events_carry_trace_ids(
     tmp_path: Path,
 ) -> None:
@@ -885,6 +893,7 @@ async def test_sandbox_session_ops_nest_under_sdk_trace_and_events_carry_trace_i
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_sandbox_session_events_fallback_to_audit_ids_under_disabled_parent_span(
     tmp_path: Path,
 ) -> None:

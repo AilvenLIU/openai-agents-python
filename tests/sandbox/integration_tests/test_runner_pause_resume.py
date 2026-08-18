@@ -23,6 +23,7 @@ from tests.sandbox.integration_tests.test_model import TestModel
 
 @pytest.mark.asyncio
 @pytest.mark.review_optional
+@pytest.mark.requires_native_macos_sandbox
 async def test_runner_preserves_unix_local_lifecycle_state_across_pause_and_resume(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
