@@ -10,7 +10,8 @@ import pytest
 
 from agents.sandbox import SandboxPathGrant
 from agents.sandbox.errors import PtySessionNotFoundError
-from agents.sandbox.manifest import Manifest
+from agents.sandbox.manifest import Environment, Manifest
+from agents.sandbox.sandboxes import unix_local as unix_local_module
 from agents.sandbox.sandboxes.unix_local import (
     UnixLocalSandboxClient,
     UnixLocalSandboxSession,
@@ -39,6 +40,79 @@ class _RecordingUnixLocalSession(UnixLocalSandboxSession):
         _ = timeout
         self.exec_commands.append(tuple(str(part) for part in command))
         return ExecResult(stdout=b"", stderr=b"", exit_code=0)
+
+
+@pytest.mark.asyncio
+async def test_unix_local_uses_allowlisted_and_manifest_environment_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(unix_local_module.sys, "platform", "linux")
+    monkeypatch.setenv("OPENAI_API_KEY", "host-secret")
+    monkeypatch.setenv("LC_MESSAGES", "C")
+    monkeypatch.setenv("LC_PRIVATE_TOKEN", "locale-secret")
+    workspace = tmp_path / "workspace"
+    manifest = Manifest(
+        root=str(workspace),
+        environment=Environment(
+            value={
+                "HOME": "/manifest-home",
+                "LC_CTYPE": "POSIX",
+                "MANIFEST_ONLY": "configured",
+            }
+        ),
+    )
+
+    async with await UnixLocalSandboxClient().create(
+        manifest=manifest, snapshot=None, options=None
+    ) as session:
+        result = await session.exec(
+            "sh",
+            "-c",
+            "printf '%s|%s|%s|%s|%s|%s|%s' "
+            '"${OPENAI_API_KEY-unset}" "$MANIFEST_ONLY" "$HOME" '
+            '"${PATH:+set}" "$LC_MESSAGES" "$LC_CTYPE" '
+            '"${LC_PRIVATE_TOKEN-unset}"',
+            shell=False,
+        )
+
+    assert result.exit_code == 0
+    assert result.stdout.decode() == f"unset|configured|{workspace}|set|C|POSIX|unset"
+
+
+@pytest.mark.asyncio
+async def test_unix_local_host_environment_inheritance_is_runtime_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(unix_local_module.sys, "platform", "linux")
+    monkeypatch.setenv("HOST_ONLY_VALUE", "host-value")
+    manifest = Manifest(root=str(tmp_path / "workspace"))
+    inheriting_client = UnixLocalSandboxClient(inherit_host_environment=True)
+
+    async with await inheriting_client.create(
+        manifest=manifest, snapshot=None, options=None
+    ) as session:
+        created = await session.exec(
+            "sh", "-c", 'printf "%s" "${HOST_ONLY_VALUE-unset}"', shell=False
+        )
+        state = session.state
+
+    payload = inheriting_client.serialize_session_state(state)
+    assert "inherit_host_environment" not in payload
+    assert created.stdout == b"host-value"
+
+    async with await inheriting_client.resume(state) as resumed:
+        inherited_after_resume = await resumed.exec(
+            "sh", "-c", 'printf "%s" "${HOST_ONLY_VALUE-unset}"', shell=False
+        )
+    assert inherited_after_resume.stdout == b"host-value"
+
+    async with await UnixLocalSandboxClient().resume(state) as resumed_without_opt_in:
+        isolated_after_resume = await resumed_without_opt_in.exec(
+            "sh", "-c", 'printf "%s" "${HOST_ONLY_VALUE-unset}"', shell=False
+        )
+    assert isolated_after_resume.stdout == b"unset"
 
 
 @pytest.mark.asyncio
