@@ -502,6 +502,9 @@ class OpenAIResponsesModel(Model):
     def _non_null_or_omit(self, value: Any) -> Any:
         return value if value is not None else omit
 
+    def _uses_official_openai_endpoint(self) -> bool:
+        return is_official_openai_client(self._get_client())
+
     def _supports_default_prompt_cache_key(self) -> bool:
         return is_official_openai_client(self._get_client())
 
@@ -604,6 +607,8 @@ class OpenAIResponsesModel(Model):
                 if tracing.include_data():
                     span_response.span_data.response = response
                     span_response.span_data.input = input
+                elif not tracing.is_disabled() and self._uses_official_openai_endpoint():
+                    span_response.span_data._response_id = response.id
             except asyncio.CancelledError:
                 record_current_task_model_timeout_on_span(
                     span_response,
@@ -680,6 +685,12 @@ class OpenAIResponsesModel(Model):
                         chunk_type = getattr(chunk, "type", None)
                         if isinstance(chunk, ResponseCompletedEvent):
                             final_response = chunk.response
+                            if (
+                                not tracing.include_data()
+                                and not tracing.is_disabled()
+                                and self._uses_official_openai_endpoint()
+                            ):
+                                span_response.span_data._response_id = chunk.response.id
                             if model_settings.preserve_raw_usage is True:
                                 _attach_raw_usage_snapshot(chunk.response, chunk.response.usage)
                             usage = _usage_from_response(chunk.response)
@@ -1110,6 +1121,13 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
             None
         )
         self._ws_client_close_generation = 0
+
+    def _uses_official_openai_endpoint(self) -> bool:
+        base_url = prepare_openai_client_websocket_base_url(
+            self._client,
+            context="Responses websocket",
+        )
+        return is_official_openai_base_url(base_url, websocket=True)
 
     def _supports_default_prompt_cache_key(self) -> bool:
         if self._client.websocket_base_url is not None:
