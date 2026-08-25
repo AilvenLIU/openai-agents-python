@@ -152,6 +152,10 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
             model_config={
                 "temperature": self._settings.temperature,
                 "language": self._settings.language,
+                "languages": self._settings.languages,
+                "keywords": (
+                    self._settings.keywords if self._trace_include_sensitive_data else None
+                ),
                 "prompt": self._settings.prompt,
                 "turn_detection": self._turn_detection,
             },
@@ -202,13 +206,17 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
     async def _configure_session(self) -> None:
         assert self._websocket is not None, "Websocket not initialized"
         transcription_config: dict[str, Any] = {"model": self._model}
-        if self._settings.language is not None:
+        if self._settings.languages is not None:
+            transcription_config["languages"] = self._settings.languages
+        elif self._settings.language is not None:
             if self._model in {"gpt-transcribe", "gpt-live-transcribe"}:
                 transcription_config["languages"] = [self._settings.language]
             else:
                 transcription_config["language"] = self._settings.language
         if self._settings.prompt is not None:
             transcription_config["prompt"] = self._settings.prompt
+        if self._settings.keywords is not None:
+            transcription_config["keywords"] = self._settings.keywords
 
         await self._websocket.send(
             json.dumps(
