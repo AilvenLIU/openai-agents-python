@@ -29,6 +29,16 @@ You can use the context for things like:
 
 Within a single run, derived wrappers share the same underlying app context, approval state, and usage tracking. Nested [`Agent.as_tool()`][agents.agent.Agent.as_tool] runs may attach a different `tool_input`, but they do not get an isolated copy of your app state by default.
 
+### Use local context for capability visibility
+
+When function tools, MCP tools, and handoffs depend on the same request policy, keep the policy inputs or helper on your application context. Each SDK surface exposes the current run context through its own callback:
+
+-   [`FunctionTool.is_enabled`][agents.tool.FunctionTool.is_enabled] receives a `RunContextWrapper`.
+-   [`Handoff.is_enabled`][agents.handoffs.Handoff.is_enabled] receives a `RunContextWrapper`.
+-   An MCP [`tool_filter`](mcp.md#dynamic-tool-filtering) receives a [`ToolFilterContext`][agents.mcp.ToolFilterContext], whose `run_context` property contains the current `RunContextWrapper`.
+
+Adapt the shared application policy to these callbacks instead of maintaining separate capability lists. The callbacks control which capabilities the SDK exposes for the current run; they do not replace authorization that depends on model-generated arguments or the resource being accessed. Enforce those decisions inside the tool implementation or MCP server, and use [tool input guardrails](guardrails.md#tool-guardrails) or [approvals](human_in_the_loop.md) when appropriate.
+
 ### What `RunContextWrapper` exposes
 
 [`RunContextWrapper`][agents.run_context.RunContextWrapper] is a wrapper around your app-defined context object. In practice you will most often use:
