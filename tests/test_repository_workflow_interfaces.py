@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MAKEFILE = ROOT / "Makefile"
+TESTS_WORKFLOW = ROOT / ".github" / "workflows" / "tests.yml"
 EXAMPLE_RUNNER = ROOT / ".github" / "scripts" / "run_examples.sh"
 EXAMPLE_SUITE = ROOT / "examples" / "run_examples.py"
 SKILLS = ROOT / ".agents" / "skills"
@@ -24,6 +25,14 @@ def _make_recipes() -> dict[str, str]:
         elif line and not line.startswith((" ", "\t")):
             current_target = None
     return recipes
+
+
+def _workflow_job(name: str) -> str:
+    workflow = TESTS_WORKFLOW.read_text(encoding="utf-8")
+    job_pattern = rf"(?ms)^  {re.escape(name)}:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n|\Z)"
+    match = re.search(job_pattern, workflow)
+    assert match is not None
+    return match.group("body")
 
 
 def test_examples_run_analysis_skill_has_no_execution_path() -> None:
@@ -121,6 +130,17 @@ def test_all_make_integration_entry_points_use_classified_profiles() -> None:
         profile = re.search(r"--profile ([a-z0-9-]+)", recipe)
         assert profile is not None, target
         assert profile.group(1) in classified_profiles
+
+
+def test_container_integration_has_one_non_matrix_workflow_job() -> None:
+    containers_job = _workflow_job("containers")
+    tests_job = _workflow_job("tests")
+
+    assert "matrix:" not in containers_job
+    assert 'python-version: "3.14"' in containers_job
+    assert 'TESTCONTAINERS_RYUK_DISABLED: "true"' in containers_job
+    assert containers_job.count("make integration-tests-containers") == 1
+    assert "integration-tests-containers" not in tests_job
 
 
 def test_prospective_contract_preparation_removes_api_key_before_uv() -> None:
