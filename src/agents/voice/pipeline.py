@@ -11,6 +11,7 @@ from ..logger import (
     logger,
 )
 from ..tracing import TraceCtxManager
+from ..tracing.traces import NoOpTrace
 from .input import AudioInput, StreamedAudioInput
 from .model import STTModel, TTSModel
 from .pipeline_config import VoicePipelineConfig
@@ -93,19 +94,25 @@ class VoicePipeline:
             self.config.trace_include_sensitive_audio_data,
         )
 
+    def _get_trace_context(self) -> TraceCtxManager | NoOpTrace:
+        if self.config.tracing_disabled:
+            # Mask an inherited caller trace only in this pipeline's producer task.
+            return NoOpTrace()
+        return TraceCtxManager(
+            workflow_name=self.config.workflow_name or "Voice Agent",
+            trace_id=None,
+            group_id=self.config.group_id,
+            metadata=self.config.trace_metadata,
+            tracing=self.config.tracing,
+            disabled=False,
+        )
+
     async def _run_single_turn(self, audio_input: AudioInput) -> StreamedAudioResult:
         output = StreamedAudioResult(self._get_tts_model(), self.config.tts_settings, self.config)
 
         async def stream_events():
             # Keep the trace scope active for the entire async processing lifecycle.
-            with TraceCtxManager(
-                workflow_name=self.config.workflow_name or "Voice Agent",
-                trace_id=None,  # Automatically generated
-                group_id=self.config.group_id,
-                metadata=self.config.trace_metadata,
-                tracing=self.config.tracing,
-                disabled=self.config.tracing_disabled,
-            ):
+            with self._get_trace_context():
                 try:
                     input_text = await self._process_audio_input(audio_input)
                     async for text_event in self.workflow.run(input_text):
@@ -128,14 +135,7 @@ class VoicePipeline:
 
         async def process_turns():
             # Keep the trace scope active for the full streamed session.
-            with TraceCtxManager(
-                workflow_name=self.config.workflow_name or "Voice Agent",
-                trace_id=None,
-                group_id=self.config.group_id,
-                metadata=self.config.trace_metadata,
-                tracing=self.config.tracing,
-                disabled=self.config.tracing_disabled,
-            ):
+            with self._get_trace_context():
                 transcription_session = None
                 try:
                     primary_exception: BaseException | None = None
