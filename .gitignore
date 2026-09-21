@@ -144,6 +144,8 @@ cython_debug/
 .ruff_cache/
 
 # Example runtime state
+# Dapr example components may contain database credentials.
+/components/
 examples/sandbox/extensions/daytona/usaspending_text2sql/.audit_log.jsonl
 examples/sandbox/extensions/daytona/usaspending_text2sql/.session_state.json
 
