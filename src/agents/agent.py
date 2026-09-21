@@ -253,6 +253,8 @@ class AgentBase(Generic[TContext]):
 
     async def get_mcp_tools(self, run_context: RunContextWrapper[TContext]) -> list[Tool]:
         """Fetches the available tools from the MCP servers."""
+        from ._public_agent import get_public_agent
+
         convert_schemas_to_strict = self.mcp_config.get("convert_schemas_to_strict", False)
         failure_error_function = self.mcp_config.get(
             "failure_error_function", default_tool_error_function
@@ -267,7 +269,7 @@ class AgentBase(Generic[TContext]):
             self.mcp_servers,
             convert_schemas_to_strict,
             run_context,
-            self,
+            get_public_agent(self),
             failure_error_function=failure_error_function,
             include_server_in_tool_names=include_server_in_tool_names,
             reserved_tool_names=reserved_tool_names,
@@ -275,6 +277,8 @@ class AgentBase(Generic[TContext]):
 
     async def get_all_tools(self, run_context: RunContextWrapper[TContext]) -> list[Tool]:
         """All agent tools, including MCP tools and function tools."""
+        from ._public_agent import get_public_agent
+
         mcp_tools = await self.get_mcp_tools(run_context)
 
         async def _check_tool_enabled(tool: Tool) -> bool:
@@ -284,7 +288,7 @@ class AgentBase(Generic[TContext]):
             attr = tool.is_enabled
             if isinstance(attr, bool):
                 return attr
-            res = attr(run_context, self)
+            res = attr(run_context, get_public_agent(self))
             if inspect.isawaitable(res):
                 return bool(await res)
             return bool(res)
@@ -1147,5 +1151,5 @@ class Agent(AgentBase, Generic[TContext]):
         return await PromptUtil.to_model_input(
             self.prompt,
             run_context,
-            cast(Agent[TContext], get_public_agent(self)),
+            get_public_agent(self),
         )

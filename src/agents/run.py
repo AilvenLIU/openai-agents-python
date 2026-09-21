@@ -120,9 +120,7 @@ from .run_internal.run_loop import (
     _safe_redacted_persistence_error,
     cleanup_models_after_run,
     finalize_max_turns_handler_output,
-    get_all_tools,
     get_output_schema,
-    initialize_computer_tools,
     resolve_interrupted_turn,
     run_input_guardrails,
     run_output_guardrails,
@@ -1482,11 +1480,6 @@ class AgentRunner:
                             if not run_state._pending_input:
                                 run_state._generated_items = list(generated_items)
                                 run_state._session_items = list(session_items)
-                    all_tools = await get_all_tools(execution_agent, context_wrapper)
-                    all_tools = await initialize_computer_tools(
-                        tools=all_tools, context_wrapper=context_wrapper
-                    )
-
                     if current_span is None:
                         if (output_schema := get_output_schema(execution_agent)) is not None:
                             output_type_name = output_schema.name()
@@ -1699,7 +1692,6 @@ class AgentRunner:
                             model_task = asyncio.create_task(
                                 run_single_turn(
                                     bindings=current_bindings,
-                                    all_tools=all_tools,
                                     original_input=original_input,
                                     generated_items=items_for_model,
                                     hooks=hooks,
@@ -1774,7 +1766,6 @@ class AgentRunner:
                         else:
                             turn_result = await run_single_turn(
                                 bindings=current_bindings,
-                                all_tools=all_tools,
                                 original_input=original_input,
                                 generated_items=items_for_model,
                                 hooks=hooks,
