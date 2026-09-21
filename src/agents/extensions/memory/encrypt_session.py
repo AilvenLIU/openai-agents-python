@@ -114,7 +114,7 @@ class EncryptedSession(SessionABC):
     per-session key derivation and automatic expiration of old data.
 
     When items expire (exceed TTL), they are silently skipped during retrieval.
-    Successful automatic compaction on native SQLite stores also reclaims a
+    Successful automatic compaction on native SQLite and SQLAlchemy stores reclaims a
     contiguous prefix of authenticated expired envelopes in bounded batches.
 
     Note: Expired tokens are rejected based on the system clock of the application server.
